@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<opencv_storage>
+<!-- Camera Matrix and Distortion Coefficients for Camera Calibration -->
+<CameraMatrix type_id="opencv-matrix">
+  <rows>3</rows>
+  <cols>3</cols>
+  <dt>d</dt>
+  <data>
+    3895.636290089335 0. 55.471148664112732 0. 3849.9355242551692
+    513.82811672450498 0. 0. 1.</data></CameraMatrix>
+<!-- Camera Matrix (Intrinsic Parameters) -->
+<DistortionCoefficients type_id="opencv-matrix">
+  <rows>1</rows>
+  <cols>5</cols>
+  <dt>d</dt>
+  <data>
+    0.012554200713474135 0.14620446300197854 -0.0038330189804027322
+    -0.052578880119715808 -0.058718372707500022</data></DistortionCoefficients>
+<!-- Distortion Coefficients (k1, k2, p1, p2, k3) -->
+</opencv_storage>

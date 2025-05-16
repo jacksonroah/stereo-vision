@@ -1,0 +1,60 @@
+Stereo Calibration Log - 2025-04-19 21:27:43
+============================================================
+
+=== Starting Complete Stereo Calibration Workflow ===
+
+=== Starting Intrinsic Calibration Workflow ===
+
+Extracting frames from camera 1 video...
+Extracting frames from calib1.mov
+Video info: 600 frames, 30.0 FPS
+Extracting every 20 frames to get ~30 samples
+Extracted 30 frames from calib1
+
+Extracting frames from camera 2 video...
+Extracting frames from calib2.mov
+Video info: 600 frames, 30.0 FPS
+Extracting every 20 frames to get ~30 samples
+Extracted 30 frames from calib2
+
+=== Calibrating Camera 1 ===
+Found 30 images for calibration
+Successfully processed 27 out of 30 images
+Starting intrinsic calibration with 27 images
+Calibration complete! Average reprojection error: 0.03168876781487397
+Warning: Large distortion coefficient 4: 6.158554612165477
+Warning: Some calibration parameters are unusual, but we'll continue
+
+=== Calibrating Camera 2 ===
+Found 30 images for calibration
+Successfully processed 29 out of 30 images
+Starting intrinsic calibration with 29 images
+Calibration complete! Average reprojection error: 0.06533884075442059
+Warning: Large distortion coefficient 1: -2.4001091801886223
+Warning: Large distortion coefficient 4: 4.704467733159451
+Warning: Some calibration parameters are unusual, but we'll continue
+
+Intrinsic calibration completed successfully!
+
+=== Starting Extrinsic Calibration Workflow ===
+
+Extracting frames from camera 1 video...
+Extracting frames from static1.mov
+Video info: 3 frames, 30.0 FPS
+Extracting every 15 frames to get ~0 samples
+Extracted 1 frames from static1
+
+Extracting frames from camera 2 video...
+Extracting frames from static1.mov
+Video info: 3 frames, 30.0 FPS
+Extracting every 15 frames to get ~0 samples
+Extracted 1 frames from static1
+
+=== Performing Stereo Calibration ===
+
+Matching stereo frames...
+Equal number of frames - pairing by index
+Matched 1 stereo frame pairs
+Error: Not enough matching frame pairs for stereo calibration (1 found)
+Error: Extrinsic calibration failed
+Error: Extrinsic calibration step failed

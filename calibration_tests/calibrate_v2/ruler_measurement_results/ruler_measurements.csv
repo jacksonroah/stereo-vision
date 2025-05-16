@@ -1,0 +1,6 @@
+Pair,Camera 1 Video,Camera 2 Video,Ruler Length (mm),Distance to Midpoint (mm),Error (%)
+1,Cam1test2_0022.mov,Cam2test2_0022.mov,440.46005,7571.776,42.08389
+2,Cam1test2_0023.mov,Cam2test2_0023.mov,327.2345,7585.5654,5.559515
+3,Cam1test2_0026.mov,Cam2test2_0026.mov,252.07014,6599.483,-18.68705
+4,Cam1test2_0024.mov,Cam2test2_0024.mov,468.16595,7205.6255,51.02128
+5,Cam1test2_0025.mov,Cam2test2_0025.mov,397.59848,7408.815,28.257576

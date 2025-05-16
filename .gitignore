@@ -1,0 +1,37 @@
+# Python cached files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+*.egg-info/
+
+# Virtual environment
+venv/
+env/
+
+# Jupyter notebook checkpoints
+.ipynb_checkpoints
+
+# Project-specific excludes
+data/*/temp/
+*.mp4
+*.MOV
+*.mov
+
+# Mac OS specific files
+.DS_Store
+
+data/
+*.mp4
+*.MOV
+*.mov
+*.avi
+*.MP4
+*.png
+*.jpg
+*.jpeg
+
+# Consider also excluding results that can be regenerated
+*/temp/
+

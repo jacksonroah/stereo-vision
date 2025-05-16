@@ -1,0 +1,20 @@
+Stereo Calibration
+Date: 2025-04-22 16:51:44
+RMS Reprojection Error: 0.31034817054394503
+
+Rotation Matrix (Camera 2 relative to Camera 1):
+0.87988662 -0.00835602 0.47511020
+-0.00075898 0.99981939 0.01898995
+-0.47518307 -0.01706960 0.87972136
+
+Translation Vector (mm):
+-2446.68962950 -53.80681675 1703.15122710
+
+Camera Separation Distance: 2981.60 mm
+Actual camera distance: 2420.00 mm
+Distance error: 23.21%
+
+Camera 2 orientation relative to Camera 1 (Euler angles in degrees):
+Rotation around X: -1.08°
+Rotation around Y: 28.37°
+Rotation around Z: 0.23°
