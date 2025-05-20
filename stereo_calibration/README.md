@@ -52,40 +52,40 @@ For each new test, you need to record three types of videos with both cameras:
 #### Intrinsic Calibration Videos
 - **Purpose**: Calibrates individual camera settings
 - **Record**: Wave the checkerboard in front of the camera, covering the entire field of view
-- **Name files**: `intrinsic_video.mp4` in each camera folder
+- **Name files**: `intrinsic.MOV` in each camera folder
 
 #### Extrinsic Calibration Videos
 - **Purpose**: Calculates the relative position between cameras
 - **Record**: Place the checkerboard where both cameras can see it
 - **Key Improvement**: Record MULTIPLE positions (at least 3-5) of the checkerboard
 - **Name files**: 
-  - `extrinsic_video_001.mp4`
-  - `extrinsic_video_002.mp4`
+  - `extrinsic1.MOV`
+  - `extrinsic2.MOV`
   - etc.
 
-#### Validation Videos
-- **Purpose**: Verifies the accuracy of your calibration
-- **Record**: Place a ruler or object of known length visible to both cameras
-- **Name files**: `validation_video.mp4` in each camera folder
+#### Pose Estimation Videos
+- **Purpose**: Gets the 3D poses from both cameras for each video
+- **Record**: Jump around, move around, do some stuff.
+- **Name files**: `tpose.MOV` or `squat.MOV` in each camera folder
 
 ### Step 3: Run the Calibration Pipeline
 
 ```bash
 # Run intrinsic calibration
-python scripts/intrinsic_calibrator_updated.py --test_dir test_001 --base_dir /path/to/stereo_calibration
+python scripts/intrinsic.py --test_dir test_001 --base_dir /path/to/stereo_calibration
 
 # Run extrinsic calibration
-python scripts/extrinsic_calibrator_updated.py --test_dir test_001 --base_dir /path/to/stereo_calibration --actual_distance 2420
+python scripts/extrinsic.py --test_dir test_001 --base_dir /path/to/stereo_calibration --actual_distance 2420
 
 # Run validation
-python scripts/simple_validator_updated.py --test_dir test_001 --base_dir /path/to/stereo_calibration --ruler_length 310
+python scripts/3dpose.py --test_dir test_001 --base_dir /path/to/stereo_calibration 
 ```
 
 ## Calibration Steps Explained
 
 ### 1. Intrinsic Calibration
 
-The `intrinsic_calibrator_updated.py` script:
+The `intrinsic.py` script:
 
 - Extracts frames from the intrinsic calibration videos
 - Finds checkerboard patterns in the frames
@@ -95,7 +95,7 @@ The `intrinsic_calibrator_updated.py` script:
 
 ### 2. Extrinsic Calibration
 
-The `extrinsic_calibrator_updated.py` script:
+The `extrinsic.py` script:
 
 - Finds all extrinsic calibration videos for both cameras
 - Matches video pairs between cameras
@@ -108,16 +108,10 @@ The `extrinsic_calibrator_updated.py` script:
 - Supports multiple extrinsic calibration videos with different checkerboard positions
 - This is key to reducing error rates in your extrinsic calibration
 
-### 3. Validation
+### 3. Pose Estimation
 
-The `simple_validator_updated.py` script:
+The `3dpose.py` script:
 
-- Extracts frames from the validation videos
-- Allows you to mark points on a ruler or object of known length
-- Triangulates the 3D positions of these points
-- Calculates the measured length and distance to the object
-- Compares with known values to determine error rates
-- Creates visualizations and a validation report
 
 ## Tips for Better Results
 
@@ -142,16 +136,6 @@ The `simple_validator_updated.py` script:
 2. Place it at different known distances to test accuracy
 3. Make multiple measurements and average the results
 4. Try to mark the same physical points in both camera views
-
-## Understanding Your Error Rates
-
-You observed that your camera separation error (23%) is higher than your object distance error (10%). This is expected because:
-
-1. **Error Propagation**: Extrinsic calibration errors don't map linearly to distance measurement errors
-2. **Different Measurement Methods**: The baseline is calculated directly from the calibration, while the distance to the object uses triangulation
-3. **Averaging Effect**: When measuring an object, errors in the individual camera points can partially cancel out
-
-Using multiple checkerboard positions in extrinsic calibration should help reduce your baseline error significantly.
 
 ## Troubleshooting
 

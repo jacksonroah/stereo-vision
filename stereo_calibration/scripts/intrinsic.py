@@ -454,10 +454,10 @@ def main():
                       help='Test directory name (e.g., test_001)')
     parser.add_argument('--base_dir', default='.', 
                       help='Base directory for the project (default: current directory)')
-    parser.add_argument('--checkerboard_size', default='9,7', 
-                      help='Size of checkerboard as width,height inner corners (default: 9,7)')
-    parser.add_argument('--square_size', type=float, default=25.0,
-                      help='Size of checkerboard square in mm (default: 25.0)')
+    parser.add_argument('--checkerboard_size', default='7,4', 
+                      help='Size of checkerboard as width,height inner corners (default: 7,4)')
+    parser.add_argument('--square_size', type=float, default=100.0,
+                      help='Size of checkerboard square in mm (default: 100.0)')
     parser.add_argument('--frame_interval', type=int, default=15,
                       help='Extract every Nth frame from video (default: 15)')
     parser.add_argument('--max_frames', type=int, default=20,
@@ -531,7 +531,7 @@ def main():
     print("\nIntrinsic calibration complete! Results saved to results/intrinsic_params/")
     print("\nNext steps:")
     print("1. Run the extrinsic calibration with: ")
-    print(f"   python scripts/extrinsic_calibrator_updated.py --test_dir {args.test_dir} --base_dir {args.base_dir}")
+    print(f"   python scripts/extrinsic.py --test_dir {args.test_dir} --actual_distance 'your distance'")
     print("2. Validate the calibration with:")
     print(f"   python scripts/simple_validator_updated.py --test_dir {args.test_dir} --base_dir {args.base_dir}")
 

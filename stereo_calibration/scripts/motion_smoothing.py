@@ -1,460 +1,502 @@
 #!/usr/bin/env python3
-# motion_smoothing.py - Advanced motion processing for stereo vision biomechanical tracking
 import numpy as np
-import pandas as pd
 from scipy.signal import savgol_filter
-from filterpy.kalman import KalmanFilter
-import matplotlib.pyplot as plt
-from scipy.spatial.transform import Rotation as R
-import math
-import os
+import pandas as pd
+import time
+import logging
 
-class MotionProcessor:
-    def __init__(self, config=None):
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("motion_smoothing")
+
+class MotionSmoother:
+    """
+    A class for applying various smoothing techniques to 3D pose data,
+    with a focus on biomechanical constraints and motion filtering.
+    """
+    
+    # Preset configurations for different camera types/frame rates
+    PRESET_CONFIGS = {
+        'smalliphone': {  # 30 fps iPhone
+            'window_size': 9,
+            'poly_order': 2,
+            'limb_length_tolerance': 0.05,  # 5% tolerance
+            'velocity_threshold': 50.0,     # mm per frame
+            'smoothing_method': 'savgol'
+        },
+        'iphone': {  # 60 fps iPhone
+            'window_size': 13, 
+            'poly_order': 3,
+            'limb_length_tolerance': 0.04,  # 4% tolerance
+            'velocity_threshold': 80.0,     # mm per frame
+            'smoothing_method': 'savgol'
+        },
+        'edger': {  # Edgertronics 480 fps
+            'window_size': 31,
+            'poly_order': 3,
+            'limb_length_tolerance': 0.03,  # 3% tolerance
+            'velocity_threshold': 100.0,    # mm per frame
+            'smoothing_method': 'savgol'
+        }
+    }
+    
+    def __init__(self, preset='smalliphone', **kwargs):
         """
-        Initialize the motion processor with configuration options.
+        Initialize the motion smoother with specified parameters.
         
         Args:
-            config: Dictionary with configuration parameters
+            preset (str): Preset configuration ('smalliphone', 'iphone', or 'edger')
+            **kwargs: Override specific parameters from the preset
         """
-        # Default configuration
-        self.config = {
-            'filter_type': 'savgol',  # Options: 'savgol', 'kalman', 'one_euro'
-            'window_size': 7,          # Window size for Savitzky-Golay filter
-            'poly_order': 3,           # Polynomial order for Savitzky-Golay
-            'apply_anatomical_constraints': True,
-            'velocity_smoothing': True,
-            'acceleration_smoothing': True,
-            'min_confidence': 0.65,    # Minimum confidence for valid landmarks
-        }
-        
-        # Update with user configuration if provided
-        if config:
-            self.config.update(config)
-            
-        # Initialize joint angle limits (anatomical constraints in degrees)
-        self.joint_limits = {
-            # Shoulder flexion/extension (up/down)
-            'left_shoulder': {'min': 0, 'max': 180},
-            'right_shoulder': {'min': 0, 'max': 180},
-            
-            # Elbow flexion/extension
-            'left_elbow': {'min': 0, 'max': 160},  # Can't fully straighten to 180°
-            'right_elbow': {'min': 0, 'max': 160},
-            
-            # Hip flexion/extension
-            'left_hip': {'min': 0, 'max': 120},
-            'right_hip': {'min': 0, 'max': 120},
-            
-            # Knee flexion/extension
-            'left_knee': {'min': 0, 'max': 170},   # Hyperextension shouldn't exceed 10°
-            'right_knee': {'min': 0, 'max': 170},
-            
-            # Ankle (dorsiflexion/plantarflexion)
-            'left_ankle': {'min': 70, 'max': 130}, # 90° is neutral
-            'right_ankle': {'min': 70, 'max': 130}
-        }
-        
-        # Anatomical bone lengths (as ratios of height)
-        self.bone_length_ratios = {
-            'shoulder_width': 0.259,    # Shoulder width / height
-            'upper_arm': 0.186,         # Upper arm / height
-            'forearm': 0.146,           # Forearm / height
-            'hip_width': 0.191,         # Hip width / height
-            'thigh': 0.245,             # Thigh / height
-            'shin': 0.246,              # Shin / height
-        }
-        
-        # Kalman filter instances for each joint - will be initialized when needed
-        self.kalman_filters = {}
-        self.kalman_initialized = False
-        
-        # Storage for biomechanical data
-        self.velocities = {}
-        self.accelerations = {}
-        self.forces = {}
-        self.powers = {}
-        
-        # Default body mass (kg) - can be updated for specific subject
-        self.body_mass = 70.0
-        
-        # Initialize limb mass ratios (percentage of total body mass)
-        self.limb_mass_ratios = {
-            'head': 0.081,
-            'torso': 0.497,
-            'upper_arm': 0.028,
-            'forearm': 0.016,
-            'hand': 0.006,
-            'thigh': 0.1,
-            'shin': 0.0465,
-            'foot': 0.0145
-        }
-        
-        # Previous timestamps for derivatives
-        self.prev_timestamp = None
-        self.prev_positions = None
-        self.prev_velocities = None
-    
-    def initialize_kalman_filters(self, num_joints):
-        """Initialize Kalman filters for 3D joint tracking"""
-        for i in range(num_joints):
-            # Create a filter for each joint's 3D position
-            kf = KalmanFilter(dim_x=6, dim_z=3)  # State: position and velocity, Measurement: position
-            
-            # State transition matrix (position + velocity model)
-            kf.F = np.array([
-                [1, 0, 0, 1, 0, 0],  # x' = x + vx
-                [0, 1, 0, 0, 1, 0],  # y' = y + vy
-                [0, 0, 1, 0, 0, 1],  # z' = z + vz
-                [0, 0, 0, 1, 0, 0],  # vx' = vx
-                [0, 0, 0, 0, 1, 0],  # vy' = vy
-                [0, 0, 0, 0, 0, 1]   # vz' = vz
-            ])
-            
-            # Measurement matrix (we only measure position directly)
-            kf.H = np.array([
-                [1, 0, 0, 0, 0, 0],
-                [0, 1, 0, 0, 0, 0],
-                [0, 0, 1, 0, 0, 0]
-            ])
-            
-            # Measurement noise
-            kf.R = np.eye(3) * 10  # Adjusted based on expected measurement noise
-            
-            # Process noise
-            kf.Q = np.eye(6) * 0.1  # Adjusted based on expected motion variability
-            
-            # Initial state covariance
-            kf.P = np.eye(6) * 100   # High uncertainty initially
-            
-            self.kalman_filters[i] = kf
-        
-        self.kalman_initialized = True
-    
-    def get_one_euro_filter(self, fc_min=0.5, beta=0.5):
-        """Create a one euro filter for real-time filtering"""
-        class OneEuroFilter:
-            def __init__(self, fc_min, beta):
-                self.fc_min = fc_min
-                self.beta = beta
-                self.prev_raw_value = None
-                self.prev_filtered_value = None
-                self.prev_timestamp = None
-                
-            def smoothing_factor(self, t_e, fc):
-                """Calculate smoothing factor"""
-                return 1.0 / (1.0 + (2 * np.pi * fc * t_e))
-            
-            def exponential_smoothing(self, a, x, x_prev):
-                """Apply exponential smoothing"""
-                return a * x + (1 - a) * x_prev
-            
-            def filter(self, x, timestamp):
-                """Apply one euro filter to a value"""
-                if self.prev_raw_value is None:
-                    self.prev_raw_value = x
-                    self.prev_filtered_value = x
-                    self.prev_timestamp = timestamp
-                    return x
-                
-                # Calculate time difference
-                t_e = timestamp - self.prev_timestamp
-                if t_e <= 0:
-                    return self.prev_filtered_value
-                
-                # First-order low-pass filter
-                dx = (x - self.prev_raw_value) / t_e  # Derivative
-                dx_hat = self.exponential_smoothing(
-                    self.smoothing_factor(t_e, self.fc_min * self.beta * abs(dx)),
-                    dx, 0 if self.prev_timestamp is None else 
-                       (self.prev_filtered_value - self.prev_raw_value) / t_e
-                )
-                
-                # Filter cutoff frequency
-                fc = self.fc_min + self.beta * abs(dx_hat)
-                
-                # Filter the raw signal
-                filtered_value = self.exponential_smoothing(
-                    self.smoothing_factor(t_e, fc),
-                    x, self.prev_filtered_value
-                )
-                
-                # Update previous values
-                self.prev_raw_value = x
-                self.prev_filtered_value = filtered_value
-                self.prev_timestamp = timestamp
-                
-                return filtered_value
-        
-        return OneEuroFilter(fc_min, beta)
-    
-    def smooth_trajectory(self, positions, timestamps=None, joint_name=None):
-        """
-        Apply smoothing to a trajectory of 3D positions.
-        
-        Args:
-            positions: Array of 3D positions (N x 3)
-            timestamps: Array of timestamps (optional, for velocity-based filters)
-            joint_name: Name of the joint (for joint-specific filtering)
-            
-        Returns:
-            Smoothed positions
-        """
-        if not isinstance(positions, np.ndarray):
-            positions = np.array(positions)
-        
-        if len(positions) < 3:
-            return positions  # Too few points to smooth
-        
-        if self.config['filter_type'] == 'savgol':
-            # Apply Savitzky-Golay filter to each dimension separately
-            window = min(self.config['window_size'], len(positions) - (1 - len(positions) % 2))
-            if window > 2 and window % 2 == 1:  # Window must be odd and > 2
-                smoothed = np.zeros_like(positions)
-                for i in range(positions.shape[1]):
-                    smoothed[:, i] = savgol_filter(
-                        positions[:, i], 
-                        window, 
-                        self.config['poly_order']
-                    )
-                return smoothed
-            else:
-                return positions  # Can't apply filter with current settings
-            
-        elif self.config['filter_type'] == 'kalman':
-            # Apply Kalman filter
-            if not self.kalman_initialized:
-                self.initialize_kalman_filters(1)  # Initialize for a single joint
-            
-            joint_idx = 0  # Default index
-            if joint_name and joint_name in self.kalman_filters:
-                joint_idx = list(self.kalman_filters.keys()).index(joint_name)
-            
-            kf = self.kalman_filters[joint_idx]
-            smoothed = np.zeros_like(positions)
-            
-            # Initial state
-            kf.x = np.array([positions[0, 0], positions[0, 1], positions[0, 2], 0, 0, 0])
-            
-            for i in range(len(positions)):
-                # Predict
-                kf.predict()
-                
-                # Update with measurement
-                measurement = positions[i]
-                kf.update(measurement)
-                
-                # Get filtered position
-                smoothed[i] = kf.x[:3]
-            
-            return smoothed
-            
-        elif self.config['filter_type'] == 'one_euro':
-            # Apply one euro filter (requires timestamps)
-            if timestamps is None:
-                # If no timestamps provided, create artificial ones
-                timestamps = np.arange(len(positions)) / 30.0  # Assume 30 fps
-            
-            smoothed = np.zeros_like(positions)
-            
-            # Create filters for each dimension
-            filters = [self.get_one_euro_filter() for _ in range(positions.shape[1])]
-            
-            for i in range(len(positions)):
-                for j in range(positions.shape[1]):
-                    smoothed[i, j] = filters[j].filter(positions[i, j], timestamps[i])
-            
-            return smoothed
-        
+        # Start with preset configuration
+        if preset in self.PRESET_CONFIGS:
+            self.config = self.PRESET_CONFIGS[preset].copy()
+            logger.info(f"Using preset configuration: {preset}")
         else:
-            # No filtering
-            return positions
+            logger.warning(f"Unknown preset '{preset}', defaulting to 'smalliphone'")
+            self.config = self.PRESET_CONFIGS['smalliphone'].copy()
+        
+        # Override with any provided parameters
+        self.config.update(kwargs)
+        
+        # Log configuration
+        logger.info(f"Motion smoother configuration: {self.config}")
+        
+        # Initialize historical data
+        self.pose_history = []
+        self.joint_velocity_history = {}
+        self.joint_acceleration_history = {}
+        self.reference_limb_lengths = {}
+        
+        # Initialize stats for reporting
+        self.stats = {
+            'frames_processed': 0,
+            'anatomical_corrections': 0,
+            'velocity_corrections': 0,
+            'processing_time': 0
+        }
     
-    def smooth_pose_sequence(self, pose_sequence, timestamps=None):
+    def smooth_pose_sequence(self, pose_sequence):
         """
-        Apply smoothing to a sequence of 3D poses.
+        Apply smoothing to a sequence of poses.
         
         Args:
-            pose_sequence: List of dictionaries, each containing 3D joint positions
-            timestamps: List of timestamps (optional)
+            pose_sequence (list): List of pose dictionaries, each with joint positions
             
         Returns:
-            Smoothed pose sequence
+            list: Smoothed pose sequence
         """
-        if not pose_sequence:
+        start_time = time.time()
+        
+        # Reset stats for this sequence
+        self.stats = {
+            'frames_processed': 0,
+            'anatomical_corrections': 0,
+            'velocity_corrections': 0,
+            'processing_time': 0
+        }
+        
+        # Check if we have enough frames for smoothing
+        if len(pose_sequence) < self.config['window_size']:
+            logger.warning(f"Sequence too short for smoothing ({len(pose_sequence)} frames, "
+                         f"window size {self.config['window_size']}). Returning original sequence.")
             return pose_sequence
         
-        # Extract joint names
-        joint_names = list(pose_sequence[0].keys())
+        # Convert sequence to a format suitable for filtering
+        joints_data = self._extract_joint_trajectories(pose_sequence)
         
-        # Create dictionary to hold trajectories for each joint
-        trajectories = {joint: [] for joint in joint_names}
+        # Apply filtering based on configuration
+        smoothed_data = self._apply_smoothing(joints_data)
         
-        # Extract trajectories
-        for pose in pose_sequence:
-            for joint in joint_names:
-                if joint in pose:
-                    trajectories[joint].append(pose[joint])
+        # Calculate limb lengths before anatomical constraints
+        limb_lengths_before = self._calculate_average_limb_lengths(pose_sequence)
         
-        # Smooth each joint trajectory
-        smoothed_trajectories = {}
-        for joint in joint_names:
-            if len(trajectories[joint]) >= 3:  # Need at least 3 points for smoothing
-                # Convert to numpy array
-                traj = np.array(trajectories[joint])
-                
-                # Apply smoothing
-                smoothed_traj = self.smooth_trajectory(traj, timestamps, joint)
-                
-                # Store smoothed trajectory
-                smoothed_trajectories[joint] = smoothed_traj
+        # Reconstruct poses from smoothed joint data
+        smoothed_poses = self._reconstruct_poses(smoothed_data, pose_sequence)
         
-        # Reconstruct pose sequence
-        smoothed_pose_sequence = []
-        for i in range(len(pose_sequence)):
-            smoothed_pose = {}
-            for joint in joint_names:
-                if joint in smoothed_trajectories and i < len(smoothed_trajectories[joint]):
-                    smoothed_pose[joint] = smoothed_trajectories[joint][i]
-            
-            # Apply anatomical constraints if enabled
-            if self.config['apply_anatomical_constraints']:
-                smoothed_pose = self.apply_anatomical_constraints(smoothed_pose)
-            
-            smoothed_pose_sequence.append(smoothed_pose)
+        # Apply anatomical constraints
+        smoothed_poses = self._apply_anatomical_constraints(smoothed_poses, limb_lengths_before)
         
-        return smoothed_pose_sequence
-
-    def apply_anatomical_constraints(self, pose_3d):
+        # Apply velocity constraints
+        smoothed_poses = self._apply_velocity_constraints(smoothed_poses)
+        
+        # Calculate limb lengths after all constraints
+        limb_lengths_after = self._calculate_average_limb_lengths(smoothed_poses)
+        
+        # Update stats
+        self.stats['frames_processed'] = len(pose_sequence)
+        self.stats['processing_time'] = time.time() - start_time
+        
+        logger.info(f"Smoothing complete: {self.stats['frames_processed']} frames processed in "
+                  f"{self.stats['processing_time']:.3f}s")
+        logger.info(f"Anatomical corrections: {self.stats['anatomical_corrections']}, "
+                  f"Velocity corrections: {self.stats['velocity_corrections']}")
+        
+        return smoothed_poses
+    
+    def smooth_single_pose(self, pose, pose_history=None):
         """
-        Apply anatomical constraints to a 3D pose.
+        Apply smoothing to a single pose using historical data.
         
         Args:
-            pose_3d: Dictionary with 3D joint positions
+            pose (dict): Current pose with joint positions
+            pose_history (list, optional): Previous poses for temporal smoothing
             
         Returns:
-            Pose with constrained joint positions
+            dict: Smoothed pose
         """
-        if not pose_3d:
-            return pose_3d
+        if pose_history is not None:
+            self.pose_history = pose_history
         
-        # Copy the pose to avoid modifying the original
-        constrained_pose = pose_3d.copy()
+        # Add current pose to history
+        self.pose_history.append(pose)
         
-        # Apply joint angle constraints
-        constrained_pose = self.apply_joint_angle_constraints(constrained_pose)
-        
-        # Apply bone length constraints
-        constrained_pose = self.apply_bone_length_constraints(constrained_pose)
-        
-        # Apply symmetry constraints (optional for static poses)
-        # constrained_pose = self.apply_symmetry_constraints(constrained_pose)
-        
-        return constrained_pose
+        # Apply smoothing if we have enough frames
+        if len(self.pose_history) >= self.config['window_size']:
+            # Extract current history window
+            window = self.pose_history[-self.config['window_size']:]
+            
+            # Smooth the window
+            smoothed_window = self.smooth_pose_sequence(window)
+            
+            # Return only the last (current) smoothed pose
+            return smoothed_window[-1]
+        else:
+            # Not enough frames for smoothing yet, return original with anatomical constraints
+            constrained_pose = self._apply_anatomical_constraints_to_single_pose(pose)
+            return constrained_pose
     
-    def apply_joint_angle_constraints(self, pose_3d):
-        """Apply anatomical joint angle limits"""
-        if not pose_3d:
-            return pose_3d
+    def get_pose_history(self):
+        """
+        Get the current pose history.
         
-        constrained_pose = pose_3d.copy()
+        Returns:
+            list: Current pose history
+        """
+        return self.pose_history
+    
+    def get_stats(self):
+        """
+        Get smoothing statistics.
         
-        # Calculate and constrain joint angles
-        angles = self.calculate_3d_angles(pose_3d)
+        Returns:
+            dict: Statistics about the smoothing process
+        """
+        return self.stats
+    
+    def reset(self):
+        """Reset the smoother's state."""
+        self.pose_history = []
+        self.joint_velocity_history = {}
+        self.joint_acceleration_history = {}
+        self.reference_limb_lengths = {}
         
-        # Apply constraints to each joint angle
-        for joint, angle in angles.items():
-            if joint in self.joint_limits:
-                limits = self.joint_limits[joint]
+        self.stats = {
+            'frames_processed': 0,
+            'anatomical_corrections': 0,
+            'velocity_corrections': 0,
+            'processing_time': 0
+        }
+        
+        logger.info("Motion smoother reset")
+    
+    def _extract_joint_trajectories(self, pose_sequence):
+        """
+        Extract trajectories for each joint from a sequence of poses.
+        
+        Args:
+            pose_sequence (list): List of pose dictionaries
+            
+        Returns:
+            dict: Dictionary mapping joint names to arrays of positions
+        """
+        joints_data = {}
+        
+        # Determine all joint names present in the poses
+        all_joints = set()
+        for pose in pose_sequence:
+            all_joints.update(pose.keys())
+        
+        # Extract positions for each joint
+        for joint in all_joints:
+            # Initialize arrays for X, Y, Z coordinates
+            x_values = []
+            y_values = []
+            z_values = []
+            
+            # Extract positions for this joint from each pose
+            for pose in pose_sequence:
+                if joint in pose:
+                    pos = pose[joint]
+                    x_values.append(pos[0])
+                    y_values.append(pos[1])
+                    z_values.append(pos[2])
+                else:
+                    # If joint is missing in this pose, use NaN
+                    x_values.append(np.nan)
+                    y_values.append(np.nan)
+                    z_values.append(np.nan)
+            
+            # Store trajectories
+            joints_data[joint] = {
+                'x': np.array(x_values),
+                'y': np.array(y_values),
+                'z': np.array(z_values)
+            }
+        
+        return joints_data
+    
+    def _apply_smoothing(self, joints_data):
+        """
+        Apply chosen smoothing method to joint trajectories.
+        
+        Args:
+            joints_data (dict): Joint trajectories
+            
+        Returns:
+            dict: Smoothed joint trajectories
+        """
+        smoothed_data = {}
+        method = self.config['smoothing_method']
+        
+        for joint, data in joints_data.items():
+            smoothed_data[joint] = {}
+            
+            for axis in ['x', 'y', 'z']:
+                values = data[axis]
                 
-                # Check if angle is outside limits
-                if angle < limits['min'] or angle > limits['max']:
-                    # Get constrained angle
-                    constrained_angle = max(limits['min'], min(angle, limits['max']))
-                    
-                    # Apply constrained angle by adjusting child joint
-                    child_joint = self.get_child_joint(joint, pose_3d)
-                    if child_joint and child_joint in constrained_pose:
-                        # Get reference joints for the angle
-                        parent_joint = self.get_parent_joint(joint, pose_3d)
-                        if parent_joint and parent_joint in constrained_pose:
-                            # Calculate vectors
-                            v1 = constrained_pose[parent_joint] - constrained_pose[joint]
-                            v2 = constrained_pose[child_joint] - constrained_pose[joint]
-                            
-                            # Get current angle
-                            current_angle = self.calculate_angle_3d(
-                                constrained_pose[parent_joint],
-                                constrained_pose[joint],
-                                constrained_pose[child_joint]
-                            )
-                            
-                            # Calculate rotation needed
-                            angle_diff = constrained_angle - current_angle
-                            
-                            # Create rotation axis (perpendicular to plane of the angle)
-                            axis = np.cross(v1, v2)
-                            axis = axis / np.linalg.norm(axis) if np.linalg.norm(axis) > 0 else np.array([0, 0, 1])
-                            
-                            # Create rotation matrix
-                            rot = R.from_rotvec(axis * np.radians(angle_diff))
-                            
-                            # Rotate child joint position
-                            rotated_v2 = rot.apply(v2)
-                            
-                            # Update child joint position
-                            constrained_pose[child_joint] = constrained_pose[joint] + rotated_v2
+                # Skip if not enough valid values
+                if np.sum(~np.isnan(values)) < self.config['window_size']:
+                    smoothed_data[joint][axis] = values
+                    continue
+                
+                # Apply appropriate smoothing method
+                if method == 'savgol':
+                    smoothed_data[joint][axis] = self._apply_savgol_filter(values)
+                elif method == 'moving_average':
+                    smoothed_data[joint][axis] = self._apply_moving_average(values)
+                elif method == 'one_euro':
+                    smoothed_data[joint][axis] = self._apply_one_euro_filter(values, joint, axis)
+                else:
+                    # Default to Savitzky-Golay
+                    smoothed_data[joint][axis] = self._apply_savgol_filter(values)
         
-        return constrained_pose
+        return smoothed_data
     
-    def get_child_joint(self, joint, pose_3d):
-        """Get child joint for a given joint"""
-        joint_hierarchy = {
-            'left_shoulder': 'left_elbow',
-            'right_shoulder': 'right_elbow',
-            'left_elbow': 'left_wrist',
-            'right_elbow': 'right_wrist',
-            'left_hip': 'left_knee',
-            'right_hip': 'right_knee',
-            'left_knee': 'left_ankle',
-            'right_knee': 'right_ankle'
-        }
+    def _apply_savgol_filter(self, values):
+        """
+        Apply Savitzky-Golay filter to a series of values.
         
-        if joint in joint_hierarchy and joint_hierarchy[joint] in pose_3d:
-            return joint_hierarchy[joint]
+        Args:
+            values (array): Array of values to filter
+            
+        Returns:
+            array: Filtered values
+        """
+        # Handle NaN values if present
+        has_nan = np.isnan(values).any()
         
-        return None
+        if has_nan:
+            # Create a mask of valid values
+            valid_mask = ~np.isnan(values)
+            
+            if np.sum(valid_mask) < self.config['window_size']:
+                # Not enough valid points for filtering
+                return values
+            
+            # Create a copy of the values for filtering
+            filtered_values = values.copy()
+            
+            # Create indices for valid values
+            indices = np.arange(len(values))[valid_mask]
+            
+            # Filter only valid values
+            valid_values = values[valid_mask]
+            
+            # Apply Savitzky-Golay filter
+            if len(valid_values) >= self.config['window_size']:
+                # Ensure window size is odd
+                window_size = self.config['window_size']
+                if window_size % 2 == 0:
+                    window_size += 1
+                
+                # Apply the filter
+                valid_filtered = savgol_filter(
+                    valid_values, 
+                    window_size, 
+                    self.config['poly_order']
+                )
+                
+                # Replace filtered values
+                filtered_values[indices] = valid_filtered
+                
+                return filtered_values
+            else:
+                return values
+        else:
+            # No NaN values, directly apply filter
+            window_size = self.config['window_size']
+            if window_size % 2 == 0:
+                window_size += 1
+                
+            return savgol_filter(
+                values, 
+                window_size, 
+                self.config['poly_order']
+            )
     
-    def get_parent_joint(self, joint, pose_3d):
-        """Get parent joint for a given joint"""
-        joint_hierarchy = {
-            'left_elbow': 'left_shoulder',
-            'right_elbow': 'right_shoulder',
-            'left_wrist': 'left_elbow',
-            'right_wrist': 'right_elbow',
-            'left_knee': 'left_hip',
-            'right_knee': 'right_hip',
-            'left_ankle': 'left_knee',
-            'right_ankle': 'right_knee',
-            'left_shoulder': 'nose',
-            'right_shoulder': 'nose',
-            'left_hip': 'nose',
-            'right_hip': 'nose'
-        }
+    def _apply_moving_average(self, values, window_size=None):
+        """
+        Apply moving average filter to a series of values.
         
-        if joint in joint_hierarchy and joint_hierarchy[joint] in pose_3d:
-            return joint_hierarchy[joint]
+        Args:
+            values (array): Array of values to filter
+            window_size (int, optional): Window size (default: from config)
+            
+        Returns:
+            array: Filtered values
+        """
+        if window_size is None:
+            window_size = self.config['window_size']
         
-        return None
+        # Handle NaN values
+        if np.isnan(values).any():
+            # Use pandas for moving average with NaN handling
+            series = pd.Series(values)
+            return series.rolling(window=window_size, center=True, min_periods=1).mean().values
+        else:
+            # Simple moving average for non-NaN data
+            result = np.convolve(values, np.ones(window_size)/window_size, mode='same')
+            
+            # Fix edge effects
+            half_window = window_size // 2
+            result[:half_window] = values[:half_window]
+            result[-half_window:] = values[-half_window:]
+            
+            return result
     
-    def apply_bone_length_constraints(self, pose_3d):
-        """Apply bone length constraints based on anthropometric data"""
-        if not pose_3d:
-            return pose_3d
+    def _apply_one_euro_filter(self, values, joint, axis):
+        """
+        Apply One Euro Filter to a series of values.
         
-        constrained_pose = pose_3d.copy()
+        Args:
+            values (array): Array of values to filter
+            joint (str): Joint name (for tracking state)
+            axis (str): Axis name (x, y, z)
+            
+        Returns:
+            array: Filtered values
+        """
+        # One Euro Filter parameters
+        min_cutoff = 1.0  # Minimum cutoff frequency
+        beta = 0.1       # Speed coefficient
         
-        # Define limb pairs for bone length constraints
+        # Initialize filtered values with original values
+        filtered = np.copy(values)
+        
+        # Handle NaN values
+        valid_mask = ~np.isnan(values)
+        if np.sum(valid_mask) < 2:
+            return values
+        
+        # Create a key for this joint+axis
+        key = f"{joint}_{axis}"
+        
+        # Initialize state if needed
+        if key not in self.joint_velocity_history:
+            self.joint_velocity_history[key] = 0.0
+        
+        # Get valid indices
+        valid_indices = np.where(valid_mask)[0]
+        
+        # Apply filter to valid values
+        prev_value = values[valid_indices[0]]
+        prev_filtered = prev_value
+        prev_timestamp = 0
+        
+        for i in range(1, len(valid_indices)):
+            idx = valid_indices[i]
+            timestamp = idx  # Use frame index as timestamp
+            
+            # Calculate dt
+            dt = timestamp - prev_timestamp
+            if dt == 0:
+                continue
+                
+            # Get current value
+            value = values[idx]
+            
+            # Calculate cutoff frequency based on derivative
+            dx = value - prev_value
+            derivative = dx / dt
+            
+            # Update velocity
+            self.joint_velocity_history[key] = derivative
+            
+            # Adjust cutoff frequency based on velocity
+            cutoff = min_cutoff + beta * abs(derivative)
+            
+            # Apply low-pass filter
+            alpha = 1.0 / (1.0 + (1.0 / (cutoff * dt)))
+            filtered_value = alpha * value + (1 - alpha) * prev_filtered
+            
+            # Store result
+            filtered[idx] = filtered_value
+            
+            # Update for next iteration
+            prev_value = value
+            prev_filtered = filtered_value
+            prev_timestamp = timestamp
+        
+        return filtered
+    
+    def _reconstruct_poses(self, smoothed_data, original_poses):
+        """
+        Reconstruct poses from smoothed joint data.
+        
+        Args:
+            smoothed_data (dict): Smoothed joint trajectories
+            original_poses (list): Original poses for structure
+            
+        Returns:
+            list: Reconstructed poses with smoothed joint positions
+        """
+        smoothed_poses = []
+        
+        for i in range(len(original_poses)):
+            new_pose = {}
+            
+            # Copy all joints from smoothed data
+            for joint in smoothed_data:
+                # Check if this joint has valid data for this frame
+                x = smoothed_data[joint]['x'][i]
+                y = smoothed_data[joint]['y'][i]
+                z = smoothed_data[joint]['z'][i]
+                
+                if not (np.isnan(x) or np.isnan(y) or np.isnan(z)):
+                    new_pose[joint] = np.array([x, y, z])
+                elif joint in original_poses[i]:
+                    # Use original value for missing data
+                    new_pose[joint] = original_poses[i][joint]
+            
+            smoothed_poses.append(new_pose)
+        
+        return smoothed_poses
+    
+    def _calculate_average_limb_lengths(self, pose_sequence):
+        """
+        Calculate average limb lengths across a pose sequence.
+        
+        Args:
+            pose_sequence (list): List of pose dictionaries
+            
+        Returns:
+            dict: Average lengths for each defined limb
+        """
+        # Define limb pairs (joints that should maintain consistent distance)
         limb_pairs = [
             ('left_shoulder', 'left_elbow'),
             ('left_elbow', 'left_wrist'),
@@ -465,1273 +507,305 @@ class MotionProcessor:
             ('right_hip', 'right_knee'),
             ('right_knee', 'right_ankle'),
             ('left_shoulder', 'right_shoulder'),
-            ('left_hip', 'right_hip')
-        ]
-        
-        # Get reference height (approximate from hip to shoulder + head)
-        reference_height = self.estimate_height(pose_3d)
-        if reference_height is None:
-            return constrained_pose  # Can't apply constraints without reference height
-        
-        # Define expected bone lengths based on ratios
-        expected_lengths = {
-            ('left_shoulder', 'left_elbow'): reference_height * self.bone_length_ratios['upper_arm'],
-            ('right_shoulder', 'right_elbow'): reference_height * self.bone_length_ratios['upper_arm'],
-            ('left_elbow', 'left_wrist'): reference_height * self.bone_length_ratios['forearm'],
-            ('right_elbow', 'right_wrist'): reference_height * self.bone_length_ratios['forearm'],
-            ('left_hip', 'left_knee'): reference_height * self.bone_length_ratios['thigh'],
-            ('right_hip', 'right_knee'): reference_height * self.bone_length_ratios['thigh'],
-            ('left_knee', 'left_ankle'): reference_height * self.bone_length_ratios['shin'],
-            ('right_knee', 'right_ankle'): reference_height * self.bone_length_ratios['shin'],
-            ('left_shoulder', 'right_shoulder'): reference_height * self.bone_length_ratios['shoulder_width'],
-            ('left_hip', 'right_hip'): reference_height * self.bone_length_ratios['hip_width']
-        }
-        
-        # For each bone, check and constrain length
-        for joint1, joint2 in limb_pairs:
-            if joint1 in constrained_pose and joint2 in constrained_pose:
-                # Calculate current bone vector and length
-                bone_vector = constrained_pose[joint2] - constrained_pose[joint1]
-                current_length = np.linalg.norm(bone_vector)
-                
-                # Get expected length
-                expected_length = expected_lengths.get((joint1, joint2))
-                if expected_length is None:
-                    # Try reverse order
-                    expected_length = expected_lengths.get((joint2, joint1))
-                
-                if expected_length is not None:
-                    # Allow for some variation (±20%)
-                    tolerance = 0.2
-                    min_length = expected_length * (1 - tolerance)
-                    max_length = expected_length * (1 + tolerance)
-                    
-                    # Check if current length is outside valid range
-                    if current_length < min_length or current_length > max_length:
-                        # Normalize the bone vector
-                        if current_length > 0:
-                            normalized_vector = bone_vector / current_length
-                        else:
-                            normalized_vector = np.array([0, 0, 1])  # Default if zero length
-                        
-                        # Constrain to valid range
-                        if current_length < min_length:
-                            new_length = min_length
-                        else:
-                            new_length = max_length
-                        
-                        # Adjust the child joint position (usually distal joint)
-                        child_joint = self.get_distal_joint(joint1, joint2)
-                        if child_joint:
-                            parent_joint = joint1 if child_joint == joint2 else joint2
-                            constrained_pose[child_joint] = constrained_pose[parent_joint] + normalized_vector * new_length
-        
-        return constrained_pose
-    
-    def get_distal_joint(self, joint1, joint2):
-        """Determine which joint is distal (further from center)"""
-        joint_hierarchy = {
-            'nose': 0,
-            'left_shoulder': 1, 'right_shoulder': 1,
-            'left_hip': 1, 'right_hip': 1,
-            'left_elbow': 2, 'right_elbow': 2,
-            'left_knee': 2, 'right_knee': 2,
-            'left_wrist': 3, 'right_wrist': 3,
-            'left_ankle': 3, 'right_ankle': 3
-        }
-        
-        # Higher level is more distal
-        level1 = joint_hierarchy.get(joint1, 0)
-        level2 = joint_hierarchy.get(joint2, 0)
-        
-        if level1 >= level2:
-            return joint1
-        else:
-            return joint2
-    
-    def estimate_height(self, pose_3d):
-        """Estimate subject height from pose data"""
-        if not pose_3d:
-            return None
-        
-        # Check if we have key joints for height estimation
-        required_joints = ['nose', 'left_hip', 'right_hip', 'left_ankle', 'right_ankle']
-        if not all(joint in pose_3d for joint in required_joints):
-            return None
-        
-        # Calculate height as distance from midpoint of ankles to nose
-        left_ankle = pose_3d['left_ankle']
-        right_ankle = pose_3d['right_ankle']
-        ankle_midpoint = (left_ankle + right_ankle) / 2
-        
-        # Get nose position
-        nose = pose_3d['nose']
-        
-        # Calculate height (vertical distance)
-        height = np.linalg.norm(nose - ankle_midpoint)
-        
-        return height
-    
-    def apply_symmetry_constraints(self, pose_3d):
-        """Apply left-right symmetry constraints for static poses"""
-        if not pose_3d:
-            return pose_3d
-        
-        constrained_pose = pose_3d.copy()
-        
-        # Define symmetric joint pairs
-        symmetric_pairs = [
-            ('left_shoulder', 'right_shoulder'),
-            ('left_elbow', 'right_elbow'),
-            ('left_wrist', 'right_wrist'),
             ('left_hip', 'right_hip'),
-            ('left_knee', 'right_knee'),
-            ('left_ankle', 'right_ankle')
+            ('left_shoulder', 'left_hip'),
+            ('right_shoulder', 'right_hip')
         ]
         
-        # Define plane of symmetry (sagittal plane)
-        if 'nose' in pose_3d and 'left_hip' in pose_3d and 'right_hip' in pose_3d:
-            # Define sagittal plane from nose and midpoint of hips
-            nose = pose_3d['nose']
-            hip_midpoint = (pose_3d['left_hip'] + pose_3d['right_hip']) / 2
-            
-            # Vector from hip midpoint to nose defines Y-axis
-            y_axis = nose - hip_midpoint
-            y_axis = y_axis / np.linalg.norm(y_axis)
-            
-            # Vector between hips defines X-axis (left to right)
-            x_axis = pose_3d['right_hip'] - pose_3d['left_hip']
-            x_axis = x_axis / np.linalg.norm(x_axis)
-            
-            # Z-axis is perpendicular to both (forward/backward)
-            z_axis = np.cross(x_axis, y_axis)
-            z_axis = z_axis / np.linalg.norm(z_axis)
-            
-            # Recompute X-axis to ensure orthogonality
-            x_axis = np.cross(y_axis, z_axis)
-            
-            # Create rotation matrix from global to local coordinates
-            rot_matrix = np.vstack((x_axis, y_axis, z_axis)).T
-            
-            # For each symmetric joint pair
-            for left_joint, right_joint in symmetric_pairs:
-                if left_joint in pose_3d and right_joint in pose_3d:
-                    # Transform to local coordinates
-                    left_local = rot_matrix.T @ (pose_3d[left_joint] - hip_midpoint)
-                    right_local = rot_matrix.T @ (pose_3d[right_joint] - hip_midpoint)
+        # Initialize counters and sums
+        length_sums = {pair: 0.0 for pair in limb_pairs}
+        length_counts = {pair: 0 for pair in limb_pairs}
+        
+        # Calculate lengths for each pose
+        for pose in pose_sequence:
+            for joint1, joint2 in limb_pairs:
+                if joint1 in pose and joint2 in pose:
+                    # Calculate Euclidean distance
+                    distance = np.linalg.norm(pose[joint1] - pose[joint2])
                     
-                    # Average Y and Z coordinates
-                    avg_y = (left_local[1] + right_local[1]) / 2
-                    avg_z = (left_local[2] + right_local[2]) / 2
+                    # Only use reasonable values
+                    if 10.0 < distance < 600.0:  # mm
+                        length_sums[(joint1, joint2)] += distance
+                        length_counts[(joint1, joint2)] += 1
+        
+        # Calculate averages
+        avg_lengths = {}
+        for pair in limb_pairs:
+            if length_counts[pair] > 0:
+                avg_lengths[pair] = length_sums[pair] / length_counts[pair]
+        
+        return avg_lengths
+    
+    def _apply_anatomical_constraints(self, pose_sequence, reference_lengths=None):
+        """
+        Apply anatomical constraints to a sequence of poses.
+        
+        Args:
+            pose_sequence (list): List of pose dictionaries
+            reference_lengths (dict, optional): Reference limb lengths
+            
+        Returns:
+            list: Pose sequence with enforced anatomical constraints
+        """
+        # If no reference lengths provided, calculate from the sequence
+        if reference_lengths is None:
+            reference_lengths = self._calculate_average_limb_lengths(pose_sequence)
+        
+        # Store reference lengths for later use
+        self.reference_limb_lengths = reference_lengths
+        
+        # Apply constraints to each pose
+        constrained_poses = []
+        for pose in pose_sequence:
+            constrained_pose = self._apply_anatomical_constraints_to_single_pose(
+                pose, reference_lengths)
+            constrained_poses.append(constrained_pose)
+        
+        return constrained_poses
+    
+    def _apply_anatomical_constraints_to_single_pose(self, pose, reference_lengths=None):
+        """
+        Apply anatomical constraints to a single pose.
+        
+        Args:
+            pose (dict): Pose dictionary with joint positions
+            reference_lengths (dict, optional): Reference limb lengths
+            
+        Returns:
+            dict: Pose with enforced anatomical constraints
+        """
+        # Make a copy to avoid modifying the original
+        constrained_pose = {k: v.copy() for k, v in pose.items()}
+        
+        # Use provided reference lengths or stored ones
+        if reference_lengths is None:
+            reference_lengths = self.reference_limb_lengths
+            
+            # If still no reference lengths, use default reasonable values
+            if not reference_lengths:
+                # Default anthropometric values (in mm, approximate)
+                reference_lengths = {
+                    ('left_shoulder', 'left_elbow'): 300.0,
+                    ('left_elbow', 'left_wrist'): 250.0,
+                    ('right_shoulder', 'right_elbow'): 300.0,
+                    ('right_elbow', 'right_wrist'): 250.0,
+                    ('left_hip', 'left_knee'): 400.0,
+                    ('left_knee', 'left_ankle'): 380.0,
+                    ('right_hip', 'right_knee'): 400.0,
+                    ('right_knee', 'right_ankle'): 380.0,
+                    ('left_shoulder', 'right_shoulder'): 350.0,
+                    ('left_hip', 'right_hip'): 250.0,
+                    ('left_shoulder', 'left_hip'): 450.0,
+                    ('right_shoulder', 'right_hip'): 450.0
+                }
+        
+        # Apply limb length constraints
+        corrections_made = 0
+        for (joint1, joint2), ref_length in reference_lengths.items():
+            if joint1 in constrained_pose and joint2 in constrained_pose:
+                # Calculate current length
+                current_vector = constrained_pose[joint2] - constrained_pose[joint1]
+                current_length = np.linalg.norm(current_vector)
+                
+                # Check if adjustment needed
+                tolerance = self.config['limb_length_tolerance']
+                if abs(current_length - ref_length) / ref_length > tolerance:
+                    # Adjust joint positions to match reference length
+                    normalized_vector = current_vector / current_length
+                    new_vector = normalized_vector * ref_length
                     
-                    # Create symmetrical local coordinates
-                    left_local_sym = np.array([-abs(left_local[0]), avg_y, avg_z])
-                    right_local_sym = np.array([abs(right_local[0]), avg_y, avg_z])
+                    # Move both joints equally
+                    midpoint = (constrained_pose[joint1] + constrained_pose[joint2]) / 2
+                    constrained_pose[joint1] = midpoint - new_vector / 2
+                    constrained_pose[joint2] = midpoint + new_vector / 2
                     
-                    # Transform back to global coordinates
-                    constrained_pose[left_joint] = rot_matrix @ left_local_sym + hip_midpoint
-                    constrained_pose[right_joint] = rot_matrix @ right_local_sym + hip_midpoint
+                    corrections_made += 1
+        
+        # Update stats
+        self.stats['anatomical_corrections'] += corrections_made
         
         return constrained_pose
     
-    def calculate_3d_angles(self, pose_3d):
-        """Calculate 3D joint angles from pose data"""
-        if not pose_3d:
-            return {}
-        
-        angles = {}
-        
-        # Calculate shoulder angles (between hip, shoulder, and elbow)
-        if all(k in pose_3d for k in ['right_hip', 'right_shoulder', 'right_elbow']):
-            angles['right_shoulder'] = self.calculate_angle_3d(
-                pose_3d['right_hip'], 
-                pose_3d['right_shoulder'], 
-                pose_3d['right_elbow']
-            )
-        
-        if all(k in pose_3d for k in ['left_hip', 'left_shoulder', 'left_elbow']):
-            angles['left_shoulder'] = self.calculate_angle_3d(
-                pose_3d['left_hip'], 
-                pose_3d['left_shoulder'], 
-                pose_3d['left_elbow']
-            )
-        
-        # Calculate elbow angles (between shoulder, elbow, and wrist)
-        if all(k in pose_3d for k in ['right_shoulder', 'right_elbow', 'right_wrist']):
-            angles['right_elbow'] = self.calculate_angle_3d(
-                pose_3d['right_shoulder'], 
-                pose_3d['right_elbow'], 
-                pose_3d['right_wrist']
-            )
-        
-        if all(k in pose_3d for k in ['left_shoulder', 'left_elbow', 'left_wrist']):
-            angles['left_elbow'] = self.calculate_angle_3d(
-                pose_3d['left_shoulder'], 
-                pose_3d['left_elbow'], 
-                pose_3d['left_wrist']
-            )
-        
-        # Calculate hip angles (between shoulder, hip, and knee)
-        if all(k in pose_3d for k in ['right_shoulder', 'right_hip', 'right_knee']):
-            angles['right_hip'] = self.calculate_angle_3d(
-                pose_3d['right_shoulder'], 
-                pose_3d['right_hip'], 
-                pose_3d['right_knee']
-            )
-        
-        if all(k in pose_3d for k in ['left_shoulder', 'left_hip', 'left_knee']):
-            angles['left_hip'] = self.calculate_angle_3d(
-                pose_3d['left_shoulder'], 
-                pose_3d['left_hip'], 
-                pose_3d['left_knee']
-            )
-        
-        # Calculate knee angles (between hip, knee, and ankle)
-        if all(k in pose_3d for k in ['right_hip', 'right_knee', 'right_ankle']):
-            angles['right_knee'] = self.calculate_angle_3d(
-                pose_3d['right_hip'], 
-                pose_3d['right_knee'], 
-                pose_3d['right_ankle']
-            )
-        
-        if all(k in pose_3d for k in ['left_hip', 'left_knee', 'left_ankle']):
-            angles['left_knee'] = self.calculate_angle_3d(
-                pose_3d['left_hip'], 
-                pose_3d['left_knee'], 
-                pose_3d['left_ankle']
-            )
-        
-        return angles
-    
-    def calculate_angle_3d(self, a, b, c):
-        """Calculate angle between three 3D points in degrees"""
-        # Create vectors
-        ba = a - b
-        bc = c - b
-        
-        # Normalize vectors
-        ba_normalized = ba / np.linalg.norm(ba)
-        bc_normalized = bc / np.linalg.norm(bc)
-        
-        # Calculate dot product and convert to angle
-        dot_product = np.dot(ba_normalized, bc_normalized)
-        
-        # Clamp dot product to valid range
-        dot_product = np.clip(dot_product, -1.0, 1.0)
-        
-        angle_rad = np.arccos(dot_product)
-        angle_deg = math.degrees(angle_rad)
-        
-        return angle_deg
-    
-    def calculate_biomechanics(self, pose_sequence, timestamps, subject_mass=None):
+    def _apply_velocity_constraints(self, pose_sequence):
         """
-        Calculate biomechanical metrics from pose sequence.
+        Apply velocity constraints to a sequence of poses.
         
         Args:
-            pose_sequence: List of dictionaries with 3D joint positions
-            timestamps: List of timestamps for each frame
-            subject_mass: Subject mass in kg (optional)
+            pose_sequence (list): List of pose dictionaries
             
         Returns:
-            Dictionary with biomechanical metrics
+            list: Pose sequence with enforced velocity constraints
         """
-        if not pose_sequence or len(pose_sequence) < 2:
-            return {}
+        constrained_poses = pose_sequence.copy()
         
-        # Update body mass if provided
-        if subject_mass:
-            self.body_mass = subject_mass
+        # Cannot apply velocity constraints with fewer than 3 frames
+        if len(pose_sequence) < 3:
+            return constrained_poses
         
-        # Initialize storage
-        biomechanics = {
-            'velocities': {},
-            'accelerations': {},
-            'forces': {},
-            'powers': {},
-            'joint_angles': {},
-            'angular_velocities': {},
-            'angular_accelerations': {},
-            'joint_moments': {},
-            'joint_powers': {}
-        }
+        velocity_threshold = self.config['velocity_threshold']
         
-        # Calculate linear velocities and accelerations
-        velocities = self.calculate_velocities(pose_sequence, timestamps)
-        accelerations = self.calculate_accelerations(velocities, timestamps)
+        # Process each joint for each frame
+        for i in range(1, len(pose_sequence) - 1):
+            prev_pose = constrained_poses[i-1]
+            curr_pose = constrained_poses[i]
+            next_pose = constrained_poses[i+1]
+            
+            for joint in curr_pose:
+                if joint in prev_pose and joint in next_pose:
+                    # Calculate velocities
+                    velocity_prev = curr_pose[joint] - prev_pose[joint]
+                    velocity_next = next_pose[joint] - curr_pose[joint]
+                    
+                    # Check for sudden speed changes
+                    speed_prev = np.linalg.norm(velocity_prev)
+                    speed_next = np.linalg.norm(velocity_next)
+                    
+                    if speed_prev > velocity_threshold or speed_next > velocity_threshold:
+                        # Calculate average velocity
+                        avg_velocity = (velocity_prev + velocity_next) / 2
+                        
+                        # Apply velocity constraint
+                        constrained_poses[i][joint] = (prev_pose[joint] + next_pose[joint]) / 2
+                        
+                        self.stats['velocity_corrections'] += 1
         
-        # Calculate forces
-        forces = self.calculate_forces(accelerations)
-        
-        # Calculate powers
-        powers = self.calculate_powers(forces, velocities)
-        
-        # Calculate joint angles
-        angles = self.calculate_joint_angles_sequence(pose_sequence)
-        
-        # Calculate angular velocities and accelerations
-        angular_velocities = self.calculate_angular_velocities(angles, timestamps)
-        angular_accelerations = self.calculate_angular_accelerations(angular_velocities, timestamps)
-        
-        # Calculate joint moments and powers
-        joint_moments = self.calculate_joint_moments(pose_sequence, accelerations)
-        joint_powers = self.calculate_joint_powers(joint_moments, angular_velocities)
-        
-        # Store results
-        biomechanics['velocities'] = velocities
-        biomechanics['accelerations'] = accelerations
-        biomechanics['forces'] = forces
-        biomechanics['powers'] = powers
-        biomechanics['joint_angles'] = angles
-        biomechanics['angular_velocities'] = angular_velocities
-        biomechanics['angular_accelerations'] = angular_accelerations
-        biomechanics['joint_moments'] = joint_moments
-        biomechanics['joint_powers'] = joint_powers
-        
-        return biomechanics
+        return constrained_poses
     
-    def calculate_velocities(self, pose_sequence, timestamps):
+    def calculate_joint_velocities(self, pose_sequence, time_delta=1.0/30.0):
         """
-        Calculate linear velocities for each joint.
+        Calculate velocities for all joints in a pose sequence.
         
         Args:
-            pose_sequence: List of dictionaries with 3D joint positions
-            timestamps: List of timestamps for each frame
+            pose_sequence (list): List of pose dictionaries
+            time_delta (float): Time between frames in seconds
             
         Returns:
-            Dictionary with velocities for each joint
+            list: List of dictionaries with joint velocities
         """
+        velocities = []
+        
+        # Need at least 2 frames to calculate velocity
         if len(pose_sequence) < 2:
-            return {}
+            return velocities
         
-        # Initialize storage
-        velocities = {i: {} for i in range(len(pose_sequence) - 1)}
-        
-        # Get list of joints
-        joints = list(pose_sequence[0].keys())
-        
-        # Calculate velocity for each joint
-        for i in range(len(pose_sequence) - 1):
-            dt = timestamps[i + 1] - timestamps[i]
+        for i in range(1, len(pose_sequence)):
+            prev_pose = pose_sequence[i-1]
+            curr_pose = pose_sequence[i]
             
-            if dt <= 0:
-                continue  # Skip invalid time differences
+            velocity_dict = {}
             
-            # Calculate velocity for each joint
-            for joint in joints:
-                if joint in pose_sequence[i] and joint in pose_sequence[i + 1]:
-                    displacement = pose_sequence[i + 1][joint] - pose_sequence[i][joint]
-                    velocity = displacement / dt  # mm/s
-                    velocities[i][joint] = velocity
-        
-        # Apply smoothing if enabled
-        if self.config['velocity_smoothing'] and len(velocities) > 2:
-            for joint in joints:
-                joint_velocities = []
-                for i in range(len(velocities)):
-                    if joint in velocities[i]:
-                        joint_velocities.append(velocities[i][joint])
-                
-                if len(joint_velocities) > 2:
-                    # Convert to numpy array
-                    joint_velocities_array = np.array(joint_velocities)
+            for joint in curr_pose:
+                if joint in prev_pose:
+                    # Calculate displacement
+                    displacement = curr_pose[joint] - prev_pose[joint]
                     
-                    # Apply smoothing
-                    smoothed_velocities = self.smooth_trajectory(joint_velocities_array)
+                    # Calculate velocity (displacement / time)
+                    velocity = displacement / time_delta
                     
-                    # Update velocities
-                    idx = 0
-                    for i in range(len(velocities)):
-                        if joint in velocities[i]:
-                            velocities[i][joint] = smoothed_velocities[idx]
-                            idx += 1
+                    # Store velocity
+                    velocity_dict[joint] = velocity
+            
+            velocities.append(velocity_dict)
         
         return velocities
     
-    def calculate_accelerations(self, velocities, timestamps):
+    def calculate_joint_accelerations(self, velocities, time_delta=1.0/30.0):
         """
-        Calculate linear accelerations for each joint.
+        Calculate accelerations from joint velocities.
         
         Args:
-            velocities: Dictionary with velocities for each joint
-            timestamps: List of timestamps for each frame
+            velocities (list): List of dictionaries with joint velocities
+            time_delta (float): Time between frames in seconds
             
         Returns:
-            Dictionary with accelerations for each joint
+            list: List of dictionaries with joint accelerations
         """
+        accelerations = []
+        
+        # Need at least 2 velocity frames to calculate acceleration
         if len(velocities) < 2:
-            return {}
+            return accelerations
         
-        # Initialize storage
-        accelerations = {i: {} for i in range(len(velocities) - 1)}
-        
-        # Get list of joints
-        joints = set()
-        for frame_velocities in velocities.values():
-            joints.update(frame_velocities.keys())
-        
-        # Calculate acceleration for each joint
-        for i in range(len(velocities) - 1):
-            # Use center point of velocity timestamps
-            t1 = timestamps[i + 1] - timestamps[i]
-            t2 = timestamps[i + 2] - timestamps[i + 1]
-            dt = (t1 + t2) / 2
+        for i in range(1, len(velocities)):
+            prev_vel = velocities[i-1]
+            curr_vel = velocities[i]
             
-            if dt <= 0:
-                continue  # Skip invalid time differences
+            accel_dict = {}
             
-            # Calculate acceleration for each joint
-            for joint in joints:
-                if (joint in velocities[i] and 
-                    joint in velocities[i + 1]):
+            for joint in curr_vel:
+                if joint in prev_vel:
+                    # Calculate velocity change
+                    vel_change = curr_vel[joint] - prev_vel[joint]
                     
-                    velocity_change = velocities[i + 1][joint] - velocities[i][joint]
-                    acceleration = velocity_change / dt  # mm/s^2
-                    accelerations[i][joint] = acceleration
-        
-        # Apply smoothing if enabled
-        if self.config['acceleration_smoothing'] and len(accelerations) > 2:
-            for joint in joints:
-                joint_accelerations = []
-                for i in range(len(accelerations)):
-                    if joint in accelerations[i]:
-                        joint_accelerations.append(accelerations[i][joint])
-                
-                if len(joint_accelerations) > 2:
-                    # Convert to numpy array
-                    joint_accelerations_array = np.array(joint_accelerations)
+                    # Calculate acceleration (velocity change / time)
+                    acceleration = vel_change / time_delta
                     
-                    # Apply smoothing
-                    smoothed_accelerations = self.smooth_trajectory(joint_accelerations_array)
-                    
-                    # Update accelerations
-                    idx = 0
-                    for i in range(len(accelerations)):
-                        if joint in accelerations[i]:
-                            accelerations[i][joint] = smoothed_accelerations[idx]
-                            idx += 1
+                    # Store acceleration
+                    accel_dict[joint] = acceleration
+            
+            accelerations.append(accel_dict)
         
         return accelerations
     
-    def calculate_forces(self, accelerations):
-        """
-        Calculate forces for each joint based on accelerations.
+    def graceful_shutdown(self):
+        """Perform cleanup operations before shutdown."""
+        # Log any final statistics or information
+        logger.info("Motion smoother shutting down")
+        logger.info(f"Total frames processed: {self.stats['frames_processed']}")
+        logger.info(f"Total anatomical corrections: {self.stats['anatomical_corrections']}")
+        logger.info(f"Total velocity corrections: {self.stats['velocity_corrections']}")
         
-        Args:
-            accelerations: Dictionary with accelerations for each joint
-            
-        Returns:
-            Dictionary with forces for each joint
-        """
-        if not accelerations:
-            return {}
+        # Reset internal state
+        self.reset()
         
-        # Initialize storage
-        forces = {i: {} for i in range(len(accelerations))}
-        
-        # Get list of joints
-        joints = set()
-        for frame_accelerations in accelerations.values():
-            joints.update(frame_accelerations.keys())
-        
-        # Calculate mass for each body segment
-        segment_masses = {
-            'head': self.body_mass * self.limb_mass_ratios['head'],
-            'torso': self.body_mass * self.limb_mass_ratios['torso'],
-            'left_upper_arm': self.body_mass * self.limb_mass_ratios['upper_arm'],
-            'right_upper_arm': self.body_mass * self.limb_mass_ratios['upper_arm'],
-            'left_forearm': self.body_mass * self.limb_mass_ratios['forearm'],
-            'right_forearm': self.body_mass * self.limb_mass_ratios['forearm'],
-            'left_hand': self.body_mass * self.limb_mass_ratios['hand'],
-            'right_hand': self.body_mass * self.limb_mass_ratios['hand'],
-            'left_thigh': self.body_mass * self.limb_mass_ratios['thigh'],
-            'right_thigh': self.body_mass * self.limb_mass_ratios['thigh'],
-            'left_shin': self.body_mass * self.limb_mass_ratios['shin'],
-            'right_shin': self.body_mass * self.limb_mass_ratios['shin'],
-            'left_foot': self.body_mass * self.limb_mass_ratios['foot'],
-            'right_foot': self.body_mass * self.limb_mass_ratios['foot']
+        return True
+
+# Demo/test function
+def test_motion_smoother():
+    """Test the motion smoother with synthetic data."""
+    # Create synthetic pose data with noise
+    np.random.seed(42)
+    frames = 100
+    
+    # Create a simple pendulum motion with noise
+    t = np.linspace(0, 2*np.pi, frames)
+    x = 300 + 100 * np.sin(t) + np.random.normal(0, 5, frames)
+    y = 400 + 100 * np.cos(t) + np.random.normal(0, 5, frames)
+    z = np.zeros(frames) + np.random.normal(0, 2, frames)
+    
+    # Create pose sequence
+    poses = []
+    for i in range(frames):
+        pose = {
+            'hand': np.array([x[i], y[i], z[i]]),
+            'elbow': np.array([x[i]*0.5, y[i]*0.5, z[i]]),
+            'shoulder': np.array([0, 400, 0])
         }
-        
-        # Map joints to body segments
-        joint_segment_map = {
-            'nose': 'head',
-            'left_shoulder': 'left_upper_arm',
-            'right_shoulder': 'right_upper_arm',
-            'left_elbow': 'left_forearm',
-            'right_elbow': 'right_forearm',
-            'left_wrist': 'left_hand',
-            'right_wrist': 'right_hand',
-            'left_hip': 'left_thigh',
-            'right_hip': 'right_thigh',
-            'left_knee': 'left_shin',
-            'right_knee': 'right_shin',
-            'left_ankle': 'left_foot',
-            'right_ankle': 'right_foot'
-        }
-        
-        # Calculate force for each joint (F = m*a)
-        for i in range(len(accelerations)):
-            for joint in accelerations[i]:
-                if joint in joint_segment_map:
-                    segment = joint_segment_map[joint]
-                    mass = segment_masses.get(segment, 1.0)  # Default to 1 kg if not found
-                    
-                    # Convert acceleration from mm/s^2 to m/s^2
-                    acceleration_ms2 = accelerations[i][joint] / 1000.0
-                    
-                    # Calculate force (F = m*a) in Newtons
-                    force = mass * acceleration_ms2
-                    
-                    forces[i][joint] = force
-        
-        return forces
+        poses.append(pose)
     
-    def calculate_powers(self, forces, velocities):
-        """
-        Calculate power for each joint (P = F*v).
-        
-        Args:
-            forces: Dictionary with forces for each joint
-            velocities: Dictionary with velocities for each joint
-            
-        Returns:
-            Dictionary with powers for each joint
-        """
-        if not forces or not velocities:
-            return {}
-        
-        # Initialize storage
-        powers = {i: {} for i in range(min(len(forces), len(velocities)))}
-        
-        # Calculate power for each joint
-        for i in range(min(len(forces), len(velocities))):
-            for joint in forces[i]:
-                if joint in velocities[i]:
-                    # Convert velocity from mm/s to m/s
-                    velocity_ms = velocities[i][joint] / 1000.0
-                    
-                    # Calculate power (P = F*v) in Watts
-                    power = np.dot(forces[i][joint], velocity_ms)
-                    
-                    powers[i][joint] = power
-        
-        return powers
+    # Initialize smoother with smalliphone preset
+    smoother = MotionSmoother(preset='smalliphone')
     
-    def calculate_joint_angles_sequence(self, pose_sequence):
-        """
-        Calculate joint angles for a sequence of poses.
-        
-        Args:
-            pose_sequence: List of dictionaries with 3D joint positions
-            
-        Returns:
-            Dictionary with joint angles for each frame
-        """
-        # Initialize storage
-        angles = {i: {} for i in range(len(pose_sequence))}
-        
-        # Calculate angles for each frame
-        for i, pose in enumerate(pose_sequence):
-            angles[i] = self.calculate_3d_angles(pose)
-        
-        return angles
+    # Apply smoothing
+    smoothed_poses = smoother.smooth_pose_sequence(poses)
     
-    def calculate_angular_velocities(self, angles, timestamps):
-        """
-        Calculate angular velocities for each joint.
-        
-        Args:
-            angles: Dictionary with joint angles for each frame
-            timestamps: List of timestamps for each frame
-            
-        Returns:
-            Dictionary with angular velocities for each joint
-        """
-        if len(angles) < 2:
-            return {}
-        
-        # Initialize storage
-        angular_velocities = {i: {} for i in range(len(angles) - 1)}
-        
-        # Get list of joints
-        joints = set()
-        for frame_angles in angles.values():
-            joints.update(frame_angles.keys())
-        
-        # Calculate angular velocity for each joint
-        for i in range(len(angles) - 1):
-            dt = timestamps[i + 1] - timestamps[i]
-            
-            if dt <= 0:
-                continue  # Skip invalid time differences
-            
-            # Calculate angular velocity for each joint
-            for joint in joints:
-                if joint in angles[i] and joint in angles[i + 1]:
-                    angle_change = angles[i + 1][joint] - angles[i][joint]
-                    
-                    # Handle angle wrapping (e.g., 350° to 10° should be -20° not +340°)
-                    if angle_change > 180:
-                        angle_change -= 360
-                    elif angle_change < -180:
-                        angle_change += 360
-                    
-                    angular_velocity = angle_change / dt  # deg/s
-                    angular_velocities[i][joint] = angular_velocity
-        
-        return angular_velocities
+    # Calculate RMSE for hand joint
+    original_hand = np.array([pose['hand'] for pose in poses])
+    smoothed_hand = np.array([pose['hand'] for pose in smoothed_poses])
     
-    def calculate_angular_accelerations(self, angular_velocities, timestamps):
-        """
-        Calculate angular accelerations for each joint.
-        
-        Args:
-            angular_velocities: Dictionary with angular velocities for each joint
-            timestamps: List of timestamps for each frame
-            
-        Returns:
-            Dictionary with angular accelerations for each joint
-        """
-        if len(angular_velocities) < 2:
-            return {}
-        
-        # Initialize storage
-        angular_accelerations = {i: {} for i in range(len(angular_velocities) - 1)}
-        
-        # Get list of joints
-        joints = set()
-        for frame_velocities in angular_velocities.values():
-            joints.update(frame_velocities.keys())
-        
-        # Calculate angular acceleration for each joint
-        for i in range(len(angular_velocities) - 1):
-            # Use center point of velocity timestamps
-            t1 = timestamps[i + 1] - timestamps[i]
-            t2 = timestamps[i + 2] - timestamps[i + 1]
-            dt = (t1 + t2) / 2
-            
-            if dt <= 0:
-                continue  # Skip invalid time differences
-            
-            # Calculate angular acceleration for each joint
-            for joint in joints:
-                if (joint in angular_velocities[i] and 
-                    joint in angular_velocities[i + 1]):
-                    
-                    velocity_change = angular_velocities[i + 1][joint] - angular_velocities[i][joint]
-                    angular_acceleration = velocity_change / dt  # deg/s^2
-                    angular_accelerations[i][joint] = angular_acceleration
-        
-        return angular_accelerations
+    rmse = np.sqrt(np.mean((original_hand - smoothed_hand)**2))
+    print(f"Hand joint RMSE: {rmse}")
     
-    def calculate_joint_moments(self, pose_sequence, accelerations):
-        """
-        Calculate joint moments (torques) for each joint.
-        
-        Args:
-            pose_sequence: List of dictionaries with 3D joint positions
-            accelerations: Dictionary with accelerations for each joint
-            
-        Returns:
-            Dictionary with joint moments for each joint
-        """
-        if not pose_sequence or not accelerations:
-            return {}
-        
-        # Initialize storage
-        joint_moments = {i: {} for i in range(min(len(pose_sequence), len(accelerations)))}
-        
-        # Define moment arms for joint torque calculation
-        # This is a simplified approach - realistic biomechanical models are more complex
-        moment_arms = {
-            'left_shoulder': 0.05,  # 5 cm moment arm (simplified)
-            'right_shoulder': 0.05,
-            'left_elbow': 0.03,     # 3 cm moment arm
-            'right_elbow': 0.03,
-            'left_hip': 0.07,       # 7 cm moment arm
-            'right_hip': 0.07,
-            'left_knee': 0.04,      # 4 cm moment arm
-            'right_knee': 0.04,
-            'left_ankle': 0.03,     # 3 cm moment arm
-            'right_ankle': 0.03
-        }
-        
-        # Get parent-child joint relationships
-        parent_child = {
-            'left_shoulder': ('left_elbow', 'left_upper_arm'),
-            'right_shoulder': ('right_elbow', 'right_upper_arm'),
-            'left_elbow': ('left_wrist', 'left_forearm'),
-            'right_elbow': ('right_wrist', 'right_forearm'),
-            'left_hip': ('left_knee', 'left_thigh'),
-            'right_hip': ('right_knee', 'right_thigh'),
-            'left_knee': ('left_ankle', 'left_shin'),
-            'right_knee': ('right_ankle', 'right_shin')
-        }
-        
-        # Calculate segment masses
-        segment_masses = {
-            'left_upper_arm': self.body_mass * self.limb_mass_ratios['upper_arm'],
-            'right_upper_arm': self.body_mass * self.limb_mass_ratios['upper_arm'],
-            'left_forearm': self.body_mass * self.limb_mass_ratios['forearm'],
-            'right_forearm': self.body_mass * self.limb_mass_ratios['forearm'],
-            'left_thigh': self.body_mass * self.limb_mass_ratios['thigh'],
-            'right_thigh': self.body_mass * self.limb_mass_ratios['thigh'],
-            'left_shin': self.body_mass * self.limb_mass_ratios['shin'],
-            'right_shin': self.body_mass * self.limb_mass_ratios['shin']
-        }
-        
-        # Calculate joint moments for each frame
-        for i in range(min(len(pose_sequence), len(accelerations))):
-            pose = pose_sequence[i]
-            frame_accelerations = accelerations[i]
-            
-            for joint in parent_child:
-                child_joint, segment = parent_child[joint]
-                
-                if (joint in pose and child_joint in pose and
-                    joint in frame_accelerations and segment in segment_masses):
-                    
-                    # Get segment mass
-                    mass = segment_masses[segment]
-                    
-                    # Get joint and child joint positions
-                    joint_pos = pose[joint]
-                    child_pos = pose[child_joint]
-                    
-                    # Calculate segment center of mass (COM) - simplified as midpoint
-                    com_pos = (joint_pos + child_pos) / 2
-                    
-                    # Get joint acceleration
-                    joint_accel = frame_accelerations[joint]
-                    
-                    # Convert acceleration from mm/s^2 to m/s^2
-                    joint_accel_ms2 = joint_accel / 1000.0
-                    
-                    # Calculate force at segment COM (F = m*a)
-                    force = mass * joint_accel_ms2
-                    
-                    # Calculate moment arm vector (from joint to COM)
-                    moment_arm_vec = com_pos - joint_pos
-                    
-                    # Convert from mm to m
-                    moment_arm_vec_m = moment_arm_vec / 1000.0
-                    
-                    # Calculate joint moment (torque) as cross product (τ = r × F)
-                    moment = np.cross(moment_arm_vec_m, force)
-                    
-                    # Store the result
-                    joint_moments[i][joint] = moment
-        
-        return joint_moments
+    # Print stats
+    print(f"Smoothing stats: {smoother.get_stats()}")
     
-    def calculate_joint_powers(self, joint_moments, angular_velocities):
-        """
-        Calculate joint powers (P = τ * ω).
-        
-        Args:
-            joint_moments: Dictionary with joint moments for each joint
-            angular_velocities: Dictionary with angular velocities for each joint
-            
-        Returns:
-            Dictionary with joint powers for each joint
-        """
-        if not joint_moments or not angular_velocities:
-            return {}
-        
-        # Initialize storage
-        joint_powers = {i: {} for i in range(min(len(joint_moments), len(angular_velocities)))}
-        
-        # Calculate joint power for each frame
-        for i in range(min(len(joint_moments), len(angular_velocities))):
-            for joint in joint_moments[i]:
-                if joint in angular_velocities[i]:
-                    # Convert angular velocity from degrees/s to radians/s
-                    angular_velocity_rad = np.radians(angular_velocities[i][joint])
-                    
-                    # Angular velocity is a scalar, but we need a vector aligned with the joint axis
-                    # This is a simplified approach - in a real system we'd need the true rotation axis
-                    # Here we'll assume the axis is the Z-axis (vertical)
-                    angular_velocity_vec = np.array([0, 0, angular_velocity_rad])
-                    
-                    # Calculate joint power (P = τ * ω) - dot product of moment and angular velocity
-                    power = np.dot(joint_moments[i][joint], angular_velocity_vec)
-                    
-                    # Store the result
-                    joint_powers[i][joint] = power
-        
-        return joint_powers
-    
-    def create_biomechanics_plots(self, biomechanics, timestamps, output_dir):
-        """
-        Create plots for biomechanical metrics.
-        
-        Args:
-            biomechanics: Dictionary with biomechanical metrics
-            timestamps: List of timestamps for each frame
-            output_dir: Directory to save plots
-        """
-        # Ensure output directory exists
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # Create plots for each metric
-        self.plot_joint_angles(biomechanics['joint_angles'], timestamps, output_dir)
-        self.plot_velocities(biomechanics['velocities'], timestamps, output_dir)
-        self.plot_accelerations(biomechanics['accelerations'], timestamps, output_dir)
-        self.plot_angular_velocities(biomechanics['angular_velocities'], timestamps, output_dir)
-        self.plot_angular_accelerations(biomechanics['angular_accelerations'], timestamps, output_dir)
-        self.plot_forces(biomechanics['forces'], timestamps, output_dir)
-        self.plot_powers(biomechanics['powers'], timestamps, output_dir)
-        self.plot_joint_moments(biomechanics['joint_moments'], timestamps, output_dir)
-        self.plot_joint_powers(biomechanics['joint_powers'], timestamps, output_dir)
-    
-    def plot_joint_angles(self, angles, timestamps, output_dir):
-        """Create plots of joint angles over time"""
-        if not angles:
-            return
-        
-        # Create figure
-        plt.figure(figsize=(12, 10))
-        
-        # Split into multiple subplots
-        plt.subplot(2, 2, 1)
-        self.plot_metric(angles, timestamps, ['left_shoulder', 'right_shoulder'], 
-                        'Shoulder Angles', 'Angle (degrees)')
-        
-        plt.subplot(2, 2, 2)
-        self.plot_metric(angles, timestamps, ['left_elbow', 'right_elbow'], 
-                        'Elbow Angles', 'Angle (degrees)')
-        
-        plt.subplot(2, 2, 3)
-        self.plot_metric(angles, timestamps, ['left_hip', 'right_hip'], 
-                        'Hip Angles', 'Angle (degrees)')
-        
-        plt.subplot(2, 2, 4)
-        self.plot_metric(angles, timestamps, ['left_knee', 'right_knee'], 
-                        'Knee Angles', 'Angle (degrees)')
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, 'joint_angles.png'), dpi=300)
-        plt.close()
-    
-    def plot_velocities(self, velocities, timestamps, output_dir):
-        """Create plots of linear velocities over time"""
-        if not velocities:
-            return
-        
-        # Create figure
-        plt.figure(figsize=(12, 10))
-        
-        # Plot velocities for key joints
-        key_joints = [
-            ('left_wrist', 'right_wrist'),
-            ('left_elbow', 'right_elbow'),
-            ('left_knee', 'right_knee'),
-            ('left_ankle', 'right_ankle')
-        ]
-        
-        for i, (left_joint, right_joint) in enumerate(key_joints):
-            plt.subplot(2, 2, i+1)
-            
-            # Calculate speed (magnitude of velocity)
-            left_speeds = []
-            right_speeds = []
-            plot_timestamps = []
-            
-            for frame in range(len(velocities)):
-                if left_joint in velocities[frame] and right_joint in velocities[frame]:
-                    # Get frame timestamp
-                    if frame < len(timestamps) - 1:
-                        plot_timestamps.append(timestamps[frame])
-                        
-                        # Calculate speed (magnitude of velocity)
-                        left_speed = np.linalg.norm(velocities[frame][left_joint])
-                        right_speed = np.linalg.norm(velocities[frame][right_joint])
-                        
-                        left_speeds.append(left_speed)
-                        right_speeds.append(right_speed)
-            
-            # Plot speeds
-            if plot_timestamps:
-                plt.plot(plot_timestamps, left_speeds, 'b-', label=f"Left {left_joint.split('_')[1]}")
-                plt.plot(plot_timestamps, right_speeds, 'r-', label=f"Right {right_joint.split('_')[1]}")
-                plt.title(f"{left_joint.split('_')[1].capitalize()} Speed")
-                plt.xlabel('Time (s)')
-                plt.ylabel('Speed (mm/s)')
-                plt.grid(True)
-                plt.legend()
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, 'joint_velocities.png'), dpi=300)
-        plt.close()
+    return {
+        'original': poses,
+        'smoothed': smoothed_poses,
+        'stats': smoother.get_stats()
+    }
 
-    def plot_accelerations(self, accelerations, timestamps, output_dir):
-        """Create plots of linear accelerations over time"""
-        if not accelerations:
-            return
-        
-        # Create figure
-        plt.figure(figsize=(12, 10))
-        
-        # Plot accelerations for key joints
-        key_joints = [
-            ('left_wrist', 'right_wrist'),
-            ('left_elbow', 'right_elbow'),
-            ('left_knee', 'right_knee'),
-            ('left_ankle', 'right_ankle')
-        ]
-        
-        for i, (left_joint, right_joint) in enumerate(key_joints):
-            plt.subplot(2, 2, i+1)
-            
-            # Calculate acceleration magnitude
-            left_accel = []
-            right_accel = []
-            plot_timestamps = []
-            
-            for frame in range(len(accelerations)):
-                if frame < len(timestamps) - 2 and left_joint in accelerations[frame] and right_joint in accelerations[frame]:
-                    plot_timestamps.append(timestamps[frame+1])  # Acceleration is centered between frames
-                    
-                    # Calculate acceleration magnitude
-                    left_accel_mag = np.linalg.norm(accelerations[frame][left_joint])
-                    right_accel_mag = np.linalg.norm(accelerations[frame][right_joint])
-                    
-                    left_accel.append(left_accel_mag)
-                    right_accel.append(right_accel_mag)
-            
-            # Plot acceleration magnitudes
-            if plot_timestamps:
-                plt.plot(plot_timestamps, left_accel, 'b-', label=f"Left {left_joint.split('_')[1]}")
-                plt.plot(plot_timestamps, right_accel, 'r-', label=f"Right {right_joint.split('_')[1]}")
-                plt.title(f"{left_joint.split('_')[1].capitalize()} Acceleration")
-                plt.xlabel('Time (s)')
-                plt.ylabel('Acceleration (mm/s²)')
-                plt.grid(True)
-                plt.legend()
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, 'joint_accelerations.png'), dpi=300)
-        plt.close()
-
-    def plot_angular_velocities(self, angular_velocities, timestamps, output_dir):
-        """Create plots of angular velocities over time"""
-        if not angular_velocities:
-            return
-        
-        # Create figure
-        plt.figure(figsize=(12, 10))
-        
-        # Define joint groups
-        joint_groups = [
-            (['left_shoulder', 'right_shoulder'], 'Shoulder Angular Velocity'),
-            (['left_elbow', 'right_elbow'], 'Elbow Angular Velocity'),
-            (['left_hip', 'right_hip'], 'Hip Angular Velocity'),
-            (['left_knee', 'right_knee'], 'Knee Angular Velocity')
-        ]
-        
-        # Plot each joint group
-        for i, (joints, title) in enumerate(joint_groups):
-            plt.subplot(2, 2, i+1)
-            self.plot_metric(angular_velocities, timestamps, joints, title, 'Angular Velocity (deg/s)')
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, 'angular_velocities.png'), dpi=300)
-        plt.close()
-
-    def plot_angular_accelerations(self, angular_accelerations, timestamps, output_dir):
-        """Create plots of angular accelerations over time"""
-        if not angular_accelerations:
-            return
-        
-        # Create figure
-        plt.figure(figsize=(12, 10))
-        
-        # Define joint groups
-        joint_groups = [
-            (['left_shoulder', 'right_shoulder'], 'Shoulder Angular Acceleration'),
-            (['left_elbow', 'right_elbow'], 'Elbow Angular Acceleration'),
-            (['left_hip', 'right_hip'], 'Hip Angular Acceleration'),
-            (['left_knee', 'right_knee'], 'Knee Angular Acceleration')
-        ]
-        
-        # Plot each joint group
-        for i, (joints, title) in enumerate(joint_groups):
-            plt.subplot(2, 2, i+1)
-            self.plot_metric(angular_accelerations, timestamps, joints, title, 'Angular Acceleration (deg/s²)')
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, 'angular_accelerations.png'), dpi=300)
-        plt.close()
-
-    def plot_forces(self, forces, timestamps, output_dir):
-        """Create plots of forces over time"""
-        if not forces:
-            return
-        
-        # Create figure
-        plt.figure(figsize=(12, 10))
-        
-        # Plot forces for key joints
-        key_joints = [
-            ('left_wrist', 'right_wrist'),
-            ('left_elbow', 'right_elbow'),
-            ('left_knee', 'right_knee'),
-            ('left_ankle', 'right_ankle')
-        ]
-        
-        for i, (left_joint, right_joint) in enumerate(key_joints):
-            plt.subplot(2, 2, i+1)
-            
-            # Calculate force magnitude
-            left_forces = []
-            right_forces = []
-            plot_timestamps = []
-            
-            for frame in range(len(forces)):
-                if left_joint in forces[frame] and right_joint in forces[frame]:
-                    if frame < len(timestamps):
-                        plot_timestamps.append(timestamps[frame])
-                        
-                        # Calculate force magnitude (N)
-                        left_force = np.linalg.norm(forces[frame][left_joint])
-                        right_force = np.linalg.norm(forces[frame][right_joint])
-                        
-                        left_forces.append(left_force)
-                        right_forces.append(right_force)
-            
-            # Plot forces
-            if plot_timestamps:
-                plt.plot(plot_timestamps, left_forces, 'b-', label=f"Left {left_joint.split('_')[1]}")
-                plt.plot(plot_timestamps, right_forces, 'r-', label=f"Right {right_joint.split('_')[1]}")
-                plt.title(f"{left_joint.split('_')[1].capitalize()} Force")
-                plt.xlabel('Time (s)')
-                plt.ylabel('Force (N)')
-                plt.grid(True)
-                plt.legend()
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, 'joint_forces.png'), dpi=300)
-        plt.close()
-
-    def plot_powers(self, powers, timestamps, output_dir):
-        """Create plots of powers over time"""
-        if not powers:
-            return
-        
-        # Create figure
-        plt.figure(figsize=(12, 10))
-        
-        # Define joint groups
-        joint_groups = [
-            (['left_shoulder', 'right_shoulder'], 'Shoulder Power'),
-            (['left_elbow', 'right_elbow'], 'Elbow Power'),
-            (['left_hip', 'right_hip'], 'Hip Power'),
-            (['left_knee', 'right_knee'], 'Knee Power')
-        ]
-        
-        # Plot each joint group
-        for i, (joints, title) in enumerate(joint_groups):
-            plt.subplot(2, 2, i+1)
-            self.plot_metric(powers, timestamps, joints, title, 'Power (W)')
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, 'joint_powers.png'), dpi=300)
-        plt.close()
-
-    def plot_joint_moments(self, joint_moments, timestamps, output_dir):
-        """Create plots of joint moments over time"""
-        if not joint_moments:
-            return
-        
-        # Create figure
-        plt.figure(figsize=(12, 10))
-        
-        # Define joint groups
-        joint_groups = [
-            (['left_shoulder', 'right_shoulder'], 'Shoulder Moment'),
-            (['left_elbow', 'right_elbow'], 'Elbow Moment'),
-            (['left_hip', 'right_hip'], 'Hip Moment'),
-            (['left_knee', 'right_knee'], 'Knee Moment')
-        ]
-        
-        # Plot each joint group
-        for i, (joints, title) in enumerate(joint_groups):
-            plt.subplot(2, 2, i+1)
-            self.plot_metric(joint_moments, timestamps, joints, title, 'Moment (Nm)')
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, 'joint_moments.png'), dpi=300)
-        plt.close()
-
-    def plot_joint_powers(self, joint_powers, timestamps, output_dir):
-        """Create plots of joint powers over time"""
-        if not joint_powers:
-            return
-        
-        # Create figure
-        plt.figure(figsize=(12, 10))
-        
-        # Define joint groups
-        joint_groups = [
-            (['left_shoulder', 'right_shoulder'], 'Shoulder Joint Power'),
-            (['left_elbow', 'right_elbow'], 'Elbow Joint Power'),
-            (['left_hip', 'right_hip'], 'Hip Joint Power'),
-            (['left_knee', 'right_knee'], 'Knee Joint Power')
-        ]
-        
-        # Plot each joint group
-        for i, (joints, title) in enumerate(joint_groups):
-            plt.subplot(2, 2, i+1)
-            self.plot_metric(joint_powers, timestamps, joints, title, 'Joint Power (W)')
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, 'joint_mechanical_powers.png'), dpi=300)
-        plt.close()
-    
-    def plot_metric(self, metric_data, timestamps, joints, title, ylabel):
-        """Helper function to plot metric data for specific joints"""
-        colors = {'left': 'b', 'right': 'r'}
-        
-        # Extract data for each joint
-        for joint in joints:
-            side = joint.split('_')[0]  # 'left' or 'right'
-            joint_data = []
-            plot_timestamps = []
-            
-            for frame in range(len(metric_data)):
-                if joint in metric_data[frame]:
-                    if isinstance(metric_data[frame][joint], (int, float)):
-                        # Scalar data
-                        value = metric_data[frame][joint]
-                        if frame < len(timestamps):
-                            plot_timestamps.append(timestamps[frame])
-                            joint_data.append(value)
-                    elif hasattr(metric_data[frame][joint], '__iter__'):
-                        # Vector data - use magnitude
-                        value = np.linalg.norm(metric_data[frame][joint])
-                        if frame < len(timestamps):
-                            plot_timestamps.append(timestamps[frame])
-                            joint_data.append(value)
-            
-            # Plot data
-            if plot_timestamps and joint_data:
-                plt.plot(plot_timestamps, joint_data, 
-                        f"{colors[side]}-", 
-                        label=f"{side.capitalize()} {joint.split('_')[1]}")
-        
-        plt.title(title)
-        plt.xlabel('Time (s)')
-        plt.ylabel(ylabel)
-        plt.grid(True)
-        plt.legend()
-    
-    def export_biomechanics_to_csv(self, biomechanics, timestamps, output_dir):
-        """
-        Export biomechanical metrics to CSV files.
-        
-        Args:
-            biomechanics: Dictionary with biomechanical metrics
-            timestamps: List of timestamps for each frame
-            output_dir: Directory to save CSV files
-        """
-        # Ensure output directory exists
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # Export angles
-        self.export_metric_to_csv(biomechanics['joint_angles'], timestamps, 
-                                  os.path.join(output_dir, 'joint_angles.csv'),
-                                  'Angle (degrees)')
-        
-        # Export velocities (speeds)
-        self.export_vector_magnitude_to_csv(biomechanics['velocities'], timestamps,
-                                          os.path.join(output_dir, 'joint_speeds.csv'),
-                                          'Speed (mm/s)')
-        
-        # Export angular velocities
-        self.export_metric_to_csv(biomechanics['angular_velocities'], timestamps,
-                                 os.path.join(output_dir, 'angular_velocities.csv'),
-                                 'Angular Velocity (deg/s)')
-        
-        # Export forces (magnitudes)
-        self.export_vector_magnitude_to_csv(biomechanics['forces'], timestamps,
-                                          os.path.join(output_dir, 'joint_forces.csv'),
-                                          'Force (N)')
-        
-        # Export powers
-        self.export_metric_to_csv(biomechanics['powers'], timestamps,
-                                 os.path.join(output_dir, 'joint_powers.csv'),
-                                 'Power (W)')
-    
-    def export_metric_to_csv(self, metric_data, timestamps, output_file, metric_name):
-        """Export scalar metric data to CSV file"""
-        if not metric_data:
-            return
-        
-        # Get list of all joints
-        joints = set()
-        for frame_data in metric_data.values():
-            joints.update(frame_data.keys())
-        
-        # Create DataFrame
-        data = {'timestamp': []}
-        for joint in sorted(joints):
-            data[f"{joint}_{metric_name}"] = []
-        
-        # Fill data
-        for frame in range(len(metric_data)):
-            if frame < len(timestamps):
-                data['timestamp'].append(timestamps[frame])
-                
-                for joint in sorted(joints):
-                    if joint in metric_data[frame]:
-                        value = metric_data[frame][joint]
-                        data[f"{joint}_{metric_name}"].append(value)
-                    else:
-                        data[f"{joint}_{metric_name}"].append(None)
-        
-        # Create DataFrame and export
-        df = pd.DataFrame(data)
-        df.to_csv(output_file, index=False)
-    
-    def export_vector_magnitude_to_csv(self, vector_data, timestamps, output_file, metric_name):
-        """Export vector magnitude data to CSV file"""
-        if not vector_data:
-            return
-        
-        # Get list of all joints
-        joints = set()
-        for frame_data in vector_data.values():
-            joints.update(frame_data.keys())
-        
-        # Create DataFrame
-        data = {'timestamp': []}
-        for joint in sorted(joints):
-            data[f"{joint}_{metric_name}"] = []
-            data[f"{joint}_x"] = []
-            data[f"{joint}_y"] = []
-            data[f"{joint}_z"] = []
-        
-        # Fill data
-        for frame in range(len(vector_data)):
-            if frame < len(timestamps):
-                data['timestamp'].append(timestamps[frame])
-                
-                for joint in sorted(joints):
-                    if joint in vector_data[frame]:
-                        # Store magnitude
-                        magnitude = np.linalg.norm(vector_data[frame][joint])
-                        data[f"{joint}_{metric_name}"].append(magnitude)
-                        
-                        # Store individual components
-                        data[f"{joint}_x"].append(vector_data[frame][joint][0])
-                        data[f"{joint}_y"].append(vector_data[frame][joint][1])
-                        data[f"{joint}_z"].append(vector_data[frame][joint][2])
-                    else:
-                        data[f"{joint}_{metric_name}"].append(None)
-                        data[f"{joint}_x"].append(None)
-                        data[f"{joint}_y"].append(None)
-                        data[f"{joint}_z"].append(None)
-        
-        # Create DataFrame and export
-        df = pd.DataFrame(data)
-        df.to_csv(output_file, index=False)
+if __name__ == "__main__":
+    # Run test if executed directly
+    results = test_motion_smoother()
+    print("Motion smoother test complete")

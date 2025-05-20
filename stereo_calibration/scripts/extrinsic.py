@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 from tqdm import tqdm
 import time
+from checkerboard_distance import validate_distance_measurement, load_validation_videos
 
 def create_directories(test_dir):
     """Create necessary directories for output with consistent naming."""
@@ -98,7 +99,7 @@ def find_extrinsic_videos(camera_dir):
     patterns = [
         "extrinsic_video_*.*",  # Traditional naming
         "extrinsic*.*",         # Any name starting with extrinsic
-        "*extrinsic*.*"         # Any name containing extrinsic
+        "x*.*"         # Any name containing extrinsic
     ]
     
     for pattern in patterns:
@@ -134,10 +135,10 @@ def match_video_pairs(left_videos, right_videos):
             return parts[2].split('.')[0]  # extrinsic_video_001.mp4 -> 001
         
         # Try to match extrinsic1.mp4 format
-        if filename.startswith("extrinsic"):
+        if filename.startswith("x"):
             # Extract numeric part from the name
             import re
-            match = re.search(r'extrinsic(\d+)', filename)
+            match = re.search(r'x(\d+)', filename)
             if match:
                 return match.group(1)  # extrinsic1.mp4 -> 1
         
@@ -209,14 +210,11 @@ def extract_frames(video_path, output_dir, camera_id, video_id, frame_interval=1
         if frame_count % frame_interval == 0:
             # Save frame in both directories for compatibility
             frame_path1 = os.path.join(output_dir, camera_id, f"{camera_id}_static_{video_id}_{saved_count:04d}.png")
-            frame_path2 = os.path.join(output_dir, f"{camera_id}_camera", f"{camera_id}_static_{video_id}_{saved_count:04d}.png")
             
             # Ensure directories exist
             os.makedirs(os.path.dirname(frame_path1), exist_ok=True)
-            os.makedirs(os.path.dirname(frame_path2), exist_ok=True)
             
             cv2.imwrite(frame_path1, frame)
-            cv2.imwrite(frame_path2, frame)  # Write to alternate path too
             
             extracted_frames.append(frame_path1)
             saved_count += 1
@@ -573,10 +571,10 @@ def main():
                       help='Test directory name (e.g., test_001)')
     parser.add_argument('--base_dir', default='.', 
                       help='Base directory for the project (default: current directory)')
-    parser.add_argument('--checkerboard_size', default='9,7', 
-                      help='Size of checkerboard as width,height inner corners (default: 9,7)')
-    parser.add_argument('--square_size', type=float, default=25.0,
-                      help='Size of checkerboard square in mm (default: 25.0)')
+    parser.add_argument('--checkerboard_size', default='7,4', 
+                      help='Size of checkerboard as width,height inner corners (default: 7,4)')
+    parser.add_argument('--square_size', type=float, default=100.0,
+                      help='Size of checkerboard square in mm (default: 100.0)')
     parser.add_argument('--frame_interval', type=int, default=15,
                       help='Extract every Nth frame from video (default: 15)')
     parser.add_argument('--max_frames', type=int, default=20,
@@ -585,6 +583,10 @@ def main():
                       help='Actual distance between cameras in mm (if known)')
     parser.add_argument('--keep_temp', action='store_true',
                   help='Keep temporary files after calibration (default: False)')
+    parser.add_argument('--measure', type=float, default=None)
+    parser.add_argument('--validation_pattern', default='validation')
+
+    
     
     args = parser.parse_args()
     
@@ -694,6 +696,70 @@ def main():
         print(f"Results saved to {extrinsic_dir}")
 
         cleanup_temp_files(temp_dir, args.keep_temp)
+
+        # Run distance validation if requested
+    if args.measure is not None:
+        print("\n" + "="*70)
+        print("DISTANCE VALIDATION")
+        print("="*70)
+        
+        # Load calibration data
+        if R is None:
+            print("Error: Extrinsic calibration must be performed first")
+            return
+            
+        # Find validation videos
+        left_video, right_video = load_validation_videos(
+            test_path, args.validation_pattern)
+        
+        if not left_video or not right_video:
+            print("Error: Could not find validation videos")
+            return
+            
+        print("\nExtracting frames from validation videos...")
+        
+        # Extract frames from validation videos
+        video_id = "validation"
+        left_frames = extract_frames(
+            left_video, temp_dir, "left", video_id, 
+            args.frame_interval, args.max_frames
+        )
+        
+        right_frames = extract_frames(
+            right_video, temp_dir, "right", video_id, 
+            args.frame_interval, args.max_frames
+        )
+        
+        # Find matching frames with checkerboard
+        matched_left_frames, matched_left_corners, matched_right_frames, matched_right_corners = find_matching_frames(
+            left_frames, right_frames, checkerboard_size, debug_dir
+        )
+        
+        if not matched_left_frames:
+            print("Error: No matching frame pairs found in validation videos")
+            return
+            
+        # Create validation directory
+        validation_dir = os.path.join(results_dir, "validation_results")
+        os.makedirs(validation_dir, exist_ok=True)
+        
+        # Validate distance measurement
+        measured_distance = validate_distance_measurement(
+            matched_left_frames, matched_right_frames, 
+            matched_left_corners, matched_right_corners,
+            left_matrix, left_dist, right_matrix, right_dist,
+            R, T, checkerboard_size, args.square_size, 
+            validation_dir, args.measure
+        )
+        
+        print("\nDistance validation complete!")
+        if measured_distance is not None:
+            if args.measure is not None:
+                error_percent = 100 * abs(measured_distance - args.measure) / args.measure
+                print(f"Measured distance: {measured_distance:.2f} mm (actual: {args.measure:.2f} mm)")
+                print(f"Error: {error_percent:.2f}%")
+            else:
+                print(f"Measured distance: {measured_distance:.2f} mm")
 
     
 

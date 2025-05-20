@@ -12,9 +12,6 @@ from datetime import datetime
 import matplotlib.pyplot as plt
 from scipy.signal import savgol_filter
 import pickle
-import argparse
-from motion_smoothing import MotionSmoother
-import logging
 
 
 class StereoPoseEstimator:
@@ -44,12 +41,6 @@ class StereoPoseEstimator:
         self.mp_drawing = mp.solutions.drawing_utils
         self.mp_drawing_styles = mp.solutions.drawing_styles
         self.mp_pose = mp.solutions.pose
-
-        # Setup and initialize motion_smoothing
-        self.motion_smoother = None
-        self.use_smoothing = False
-        self.camera_type = 'smalliphone'  # Default camera type
-
         
         # Data storage
         self.pose_3d_data = {}
@@ -83,31 +74,6 @@ class StereoPoseEstimator:
         self.pose_3d_history = []
         
         print(f"Stereo Pose Estimator initialized for test directory: {test_dir}")
-
-    def initialize_motion_smoothing(self, use_smoothing=False, camera_type='smalliphone', 
-                              window_size=None, poly_order=None):
-        """Initialize motion smoothing with specified parameters."""
-        self.use_smoothing = use_smoothing
-        self.camera_type = camera_type
-        
-        # Only create the smoother if smoothing is enabled
-        if self.use_smoothing:
-            # Create configuration with overrides if provided
-            config = {}
-            if window_size is not None:
-                config['window_size'] = window_size
-            if poly_order is not None:
-                config['poly_order'] = poly_order
-            
-            # Initialize the smoother
-            self.motion_smoother = MotionSmoother(preset=camera_type, **config)
-            print(f"Motion smoothing enabled with {camera_type} preset")
-            if window_size is not None or poly_order is not None:
-                print(f"  Overrides: window_size={window_size}, poly_order={poly_order}")
-        else:
-            self.motion_smoother = None
-            print("Motion smoothing disabled")
-
     
     def load_calibration_data(self):
         """Load intrinsic and extrinsic calibration data"""
@@ -281,9 +247,6 @@ class StereoPoseEstimator:
 
         # Determine sync offset
         frame_offset = self.determine_sync_offset(left_video, right_video)
-
-        if self.use_smoothing and self.motion_smoother is None:
-            self.initialize_motion_smoothing(True, self.camera_type)
 
         if frame_offset == 0:
             print("Flash not detected, terminating process... Sorry!")
@@ -915,65 +878,27 @@ class StereoPoseEstimator:
                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
    
     def save_results(self, pose_3d_sequence, angle_3d_sequence, fps):
-        """Save processing results with optional motion smoothing."""
-        # Create timestamps
-        timestamps = [i/fps for i in range(len(pose_3d_sequence))]
-        
-        # Apply motion smoothing if enabled
-        if self.use_smoothing and self.motion_smoother is not None:
-            print("Applying motion smoothing to 3D pose data...")
-            # Apply smoothing to pose sequence
-            smoothed_pose_sequence = self.motion_smoother.smooth_pose_sequence(pose_3d_sequence)
-            
-            # Calculate angles from smoothed poses
-            smoothed_angle_sequence = []
-            for pose in smoothed_pose_sequence:
-                angles = self.calculate_3d_angles(pose)
-                smoothed_angle_sequence.append(angles)
-            
-            # Save the original data for comparison
-            with open(os.path.join(self.output_dir, "3d_data", "original_pose_3d_data.pkl"), 'wb') as f:
-                pickle.dump({
-                    'poses': pose_3d_sequence,
-                    'angles': angle_3d_sequence,
-                    'timestamps': timestamps,
-                    'fps': fps
-                }, f)
-            
-            # Save smoothing stats
-            smoothing_stats = self.motion_smoother.get_stats()
-            with open(os.path.join(self.output_dir, "3d_data", "smoothing_stats.json"), 'w') as f:
-                import json
-                json.dump(smoothing_stats, f, indent=2)
-            
-            print(f"Motion smoothing applied: {smoothing_stats['frames_processed']} frames processed")
-            print(f"  Anatomical corrections: {smoothing_stats['anatomical_corrections']}")
-            print(f"  Velocity corrections: {smoothing_stats['velocity_corrections']}")
-            print(f"  Processing time: {smoothing_stats['processing_time']:.2f} seconds")
-            
-            # Use smoothed data for further processing
-            pose_3d_sequence = smoothed_pose_sequence
-            angle_3d_sequence = smoothed_angle_sequence
-        
-        # Save 3D pose data
-        with open(os.path.join(self.output_dir, "3d_data", "pose_3d_data.pkl"), 'wb') as f:
-            pickle.dump({
-                'poses': pose_3d_sequence,
-                'angles': angle_3d_sequence,
-                'timestamps': timestamps,
-                'fps': fps
-            }, f)
-        
-        # Create angle statistics
-        self.create_angle_statistics(angle_3d_sequence)
-        
-        # Create angle plots
-        self.create_angle_plots(angle_3d_sequence, timestamps)
-        
-        # Create 3D trajectory visualization
-        self.create_3d_visualization(pose_3d_sequence, timestamps)
-        
-        print(f"Results saved to {self.output_dir}")
+       """Save processing results"""
+       # Create timestamps
+       timestamps = [i/fps for i in range(len(pose_3d_sequence))]
+       
+       # Save 3D pose data
+       with open(os.path.join(self.output_dir, "3d_data", "pose_3d_data.pkl"), 'wb') as f:
+           pickle.dump({
+               'poses': pose_3d_sequence,
+               'angles': angle_3d_sequence,
+               'timestamps': timestamps,
+               'fps': fps
+           }, f)
+       
+       # Create angle statistics
+       self.create_angle_statistics(angle_3d_sequence)
+       
+       # Create angle plots
+       self.create_angle_plots(angle_3d_sequence, timestamps)
+       
+       # Create 3D trajectory visualization
+       self.create_3d_visualization(pose_3d_sequence, timestamps)
    
     def create_angle_statistics(self, angle_3d_sequence):
        """Calculate statistics for joint angles"""
@@ -1100,50 +1025,7 @@ class StereoPoseEstimator:
        plt.title('Knee Angles')
        plt.grid(True)
        plt.legend()
-
-       # If we applied smoothing and saved the original data, plot comparison
-       smoothed_label = " (Smoothed)" if self.use_smoothing else ""
-       orig_data_path = os.path.join(self.output_dir, "3d_data", "original_pose_3d_data.pkl")
-       if self.use_smoothing and os.path.exists(orig_data_path):
-            try:
-                with open(orig_data_path, 'rb') as f:
-                    orig_data = pickle.load(f)
-                    
-                # Plot original data with dashed lines for comparison
-                for i, (subplot_idx, joints, styles, labels) in enumerate([
-                    (1, ['right_shoulder', 'left_shoulder'], ['r--', 'b--'], 
-                    ['Right Shoulder (Orig)', 'Left Shoulder (Orig)']),
-                    (2, ['right_elbow', 'left_elbow'], ['r--', 'b--'], 
-                    ['Right Elbow (Orig)', 'Left Elbow (Orig)']),
-                    (3, ['right_hip', 'left_hip'], ['r--', 'b--'], 
-                    ['Right Hip (Orig)', 'Left Hip (Orig)']),
-                    (4, ['right_knee', 'left_knee'], ['r--', 'b--'], 
-                    ['Right Knee (Orig)', 'Left Knee (Orig)'])
-                ]):
-                    plt.subplot(2, 2, subplot_idx)
-                    
-                    # Extract original angle data
-                    angle_data = {}
-                    for joint in joints:
-                        angle_data[joint] = []
-                    
-                    # Collect original angles
-                    for angles in orig_data['angles']:
-                        for joint in joints:
-                            if joint in angles:
-                                angle_data[joint].append(angles[joint])
-                            else:
-                                angle_data[joint].append(None)
-                    
-                    # Plot original data
-                    self.plot_joint_angles(timestamps, angle_data, joints, styles, labels)
-                    
-                # Update title to indicate smoothing applied
-                plt.suptitle(f"Joint Angles{smoothed_label}")
-                    
-            except Exception as e:
-                print(f"Error plotting comparison data: {e}")
-        
+       
        plt.tight_layout()
        plt.savefig(os.path.join(self.output_dir, "plots", 'angle_plots.png'), dpi=300)
        plt.close()
@@ -1304,25 +1186,11 @@ def main():
    parser.add_argument('--max_frames', type=int, default=None, 
                      help='Maximum number of frames to process (default: all)')
    parser.add_argument('--no_display', action='store_true', help='Disable video display during processing')
-   parser.add_argument('--smooth', action='store_true', help='Apply motion smoothing')
-   parser.add_argument('--camera_type', choices=['smalliphone', 'iphone', 'edger'], 
-                    default='smalliphone', help='Camera type for smoothing parameters')
-   parser.add_argument('--window_size', type=int, default=None, 
-                    help='Override window size for smoothing')
-   parser.add_argument('--poly_order', type=int, default=None,
-                    help='Override polynomial order for smoothing')
    
    args = parser.parse_args()
    
    # Initialize pose estimator
    pose_estimator = StereoPoseEstimator(args.test_dir, args.video_pattern)
-
-   pose_estimator.initialize_motion_smoothing(
-        use_smoothing=args.smooth,
-        camera_type=args.camera_type,
-        window_size=args.window_size,
-        poly_order=args.poly_order
-    )
    
    # Set visualization options
    if args.no_display:
